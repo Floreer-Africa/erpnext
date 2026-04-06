@@ -1240,6 +1240,65 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 
 		pr.cancel()
 
+	def test_item_valuation_with_deduct_valuation_and_total_tax(self):
+		pr = make_purchase_receipt(
+			company="_Test Company with perpetual inventory",
+			warehouse="Stores - TCP1",
+			supplier_warehouse="Work In Progress - TCP1",
+			qty=5,
+			rate=100,
+			do_not_save=1,
+		)
+
+		pr.append(
+			"taxes",
+			{
+				"charge_type": "Actual",
+				"add_deduct_tax": "Deduct",
+				"account_head": "_Test Account Shipping Charges - TCP1",
+				"category": "Valuation and Total",
+				"cost_center": "Main - TCP1",
+				"description": "Valuation Discount",
+				"tax_amount": 20,
+			},
+		)
+
+		pr.insert()
+
+		self.assertAlmostEqual(pr.items[0].item_tax_amount, -20.0, places=2)
+		self.assertAlmostEqual(pr.items[0].valuation_rate, 96.0, places=2)
+
+		pr.delete()
+
+		pr = make_purchase_receipt(
+			company="_Test Company with perpetual inventory",
+			warehouse="Stores - TCP1",
+			supplier_warehouse="Work In Progress - TCP1",
+			qty=5,
+			rate=100,
+			do_not_save=1,
+		)
+
+		pr.append(
+			"taxes",
+			{
+				"charge_type": "On Net Total",
+				"add_deduct_tax": "Deduct",
+				"account_head": "_Test Account Shipping Charges - TCP1",
+				"category": "Valuation and Total",
+				"cost_center": "Main - TCP1",
+				"description": "Valuation Discount",
+				"rate": 10,
+			},
+		)
+
+		pr.insert()
+
+		self.assertAlmostEqual(pr.items[0].item_tax_amount, -50.0, places=2)
+		self.assertAlmostEqual(pr.items[0].valuation_rate, 90.0, places=2)
+
+		pr.delete()
+
 	def test_po_to_pi_and_po_to_pr_worflow_full(self):
 		"""Test following behaviour:
 		- Create PO
@@ -4547,7 +4606,7 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 
 		self.assertEqual(srbnb_cost, 1500)
 
-	def test_valuation_rate_for_rejected_materials_withoout_accepted_materials(self):
+	def test_valuation_rate_for_rejected_materials_without_accepted_materials(self):
 		item = make_item("Test Item with Rej Material Valuation WO Accepted", {"is_stock_item": 1})
 		company = "_Test Company with perpetual inventory"
 
@@ -5359,6 +5418,33 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 		for row in sabb.entries:
 			self.assertEqual(row.warehouse, "_Test Warehouse 1 - _TC")
 			self.assertEqual(row.incoming_rate, 100)
+
+	def test_bill_for_rejected_quantity_in_purchase_invoice(self):
+		item_code = make_item("Test Rejected Qty", {"is_stock_item": 1}).name
+
+		with self.change_settings("Buying Settings", {"bill_for_rejected_quantity_in_purchase_invoice": 0}):
+			pr = make_purchase_receipt(
+				item_code=item_code,
+				qty=10,
+				rejected_qty=2,
+				rate=10,
+				warehouse="_Test Warehouse - _TC",
+			)
+
+			self.assertEqual(pr.total_qty, 10)
+			self.assertEqual(pr.total, 100)
+
+		with self.change_settings("Buying Settings", {"bill_for_rejected_quantity_in_purchase_invoice": 1}):
+			pr = make_purchase_receipt(
+				item_code=item_code,
+				qty=10,
+				rejected_qty=2,
+				rate=10,
+				warehouse="_Test Warehouse - _TC",
+			)
+
+			self.assertEqual(pr.total_qty, 12)
+			self.assertEqual(pr.total, 120)
 
 
 def prepare_data_for_internal_transfer():

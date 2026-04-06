@@ -1384,6 +1384,34 @@ class TestPurchaseOrder(ERPNextTestSuite):
 		self.assertEqual(pi_2.status, "Paid")
 		self.assertEqual(po.status, "Completed")
 
+	def test_purchase_order_over_billing_missing_item(self):
+		item1 = make_item(
+			"_Test Item for Overbilling",
+		).name
+
+		item2 = make_item(
+			"_Test Item for Overbilling 2",
+		).name
+
+		po = create_purchase_order(qty=10, rate=1000, item_code=item1, do_not_save=1)
+		po.append("items", {"item_code": item2, "qty": 5, "rate": 20, "warehouse": "_Test Warehouse - _TC"})
+		po.taxes = []
+		po.insert()
+		po.submit()
+
+		pi1 = make_pi_from_po(po.name)
+		pi1.items[0].qty = 8
+		pi1.items[0].rate = 1250
+		pi1.remove(pi1.items[1])
+		pi1.insert()
+		pi1.submit()
+
+		self.assertEqual(pi1.grand_total, 10000.0)
+		self.assertTrue(len(pi1.items) == 1)
+
+		pi2 = make_pi_from_po(po.name)
+		self.assertEqual(len(pi2.items), 2)
+
 
 def create_po_for_sc_testing():
 	from erpnext.controllers.tests.test_subcontracting_controller import (
