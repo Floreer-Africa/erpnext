@@ -21,6 +21,14 @@
 				<b class="caret"></b>
 			</button>
 			<ul class="dropdown-menu dropdown-menu-right" role="menu">
+				{% if doc.doctype == 'Supplier Quotation' and doc.docstatus|int == 0 %}
+					<a class="dropdown-item" href="#" id="submit-supplier-quotation">
+						{{ _("Submit Quotation") }}
+					</a>
+					<a class="dropdown-item text-danger" href="#" id="delete-supplier-quotation">
+						{{ _("Delete") }}
+					</a>
+				{% endif %}
 				{% if doc.doctype == 'Purchase Order' and show_make_pi_button %}
 					<a class="dropdown-item"
 						href="/api/method/erpnext.buying.doctype.purchase_order.purchase_order.make_purchase_invoice_from_portal?purchase_order_name={{ doc.name }}"
@@ -34,6 +42,12 @@
 				</a>
 			</ul>
 		</div>
+		{% if doc.doctype == 'Supplier Quotation' and doc.docstatus|int == 0 %}
+			<button class="btn btn-sm ml-2" id="submit-sq-btn"
+				style="background: #b7b973; color: #1c1b18; border: none; font-weight: 600; padding: 8px 20px; border-radius: 6px;">
+				{{ _("Submit Quotation") }}
+			</button>
+		{% endif %}
 		{% if show_pay_button %}
 			<div class="form-column col-sm-6">
 				<div class="page-header-actions-block" data-html-block="header-actions">
@@ -154,6 +168,50 @@
 			<p>{{ doc.terms }}</p>
 		</div>
 	{% endif %}
+{% endblock %}
+
+{% block script %}
+<script>
+$(document).ready(function() {
+	$('#submit-supplier-quotation, #submit-sq-btn').on('click', function(e) {
+		e.preventDefault();
+		frappe.confirm(__('Submit this quotation? This cannot be undone.'), function() {
+			frappe.freeze(__('Submitting...'));
+			frappe.call({
+				method: 'frappe.client.submit',
+				args: { doc: '{{ doc.doctype }}', docname: '{{ doc.name }}' },
+				callback: function(r) {
+					frappe.unfreeze();
+					if (!r.exc) {
+						frappe.msgprint(__('Quotation submitted successfully.'));
+						setTimeout(function() { window.location.reload(); }, 1500);
+					}
+				},
+				error: function() { frappe.unfreeze(); }
+			});
+		});
+	});
+
+	$('#delete-supplier-quotation').on('click', function(e) {
+		e.preventDefault();
+		frappe.confirm(__('Delete this draft quotation?'), function() {
+			frappe.freeze(__('Deleting...'));
+			frappe.call({
+				method: 'frappe.client.delete',
+				args: { doctype: '{{ doc.doctype }}', name: '{{ doc.name }}' },
+				callback: function(r) {
+					frappe.unfreeze();
+					if (!r.exc) {
+						frappe.msgprint(__('Quotation deleted.'));
+						setTimeout(function() { window.location.href = '/supplier-quotations'; }, 1500);
+					}
+				},
+				error: function() { frappe.unfreeze(); }
+			});
+		});
+	});
+});
+</script>
 {% endblock %}
 
 {% macro item_name_and_description(d) %}

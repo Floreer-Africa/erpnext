@@ -14,13 +14,36 @@
 
 {% block header_actions %}
 {% if doc.items %}
-<button class="btn btn-primary btn-sm"
-    type="button">
+<button class="btn btn-sm"
+    type="button"
+    style="background: #b7b973; color: #1c1b18; border: none; font-weight: 600; padding: 8px 20px; border-radius: 6px;">
     {{ _("Make Quotation") }}</button>
 {% endif %}
 {% endblock %}
 
 {% block page_content %}
+<div class="rfq-instruction-banner" style="
+    background: #faf6f1;
+    border: 2px solid #b7b973;
+    border-radius: 8px;
+    padding: 16px 20px;
+    margin-bottom: 24px;
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+">
+    <svg viewBox="0 0 24 24" fill="none" stroke="#6b6d35" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="width: 24px; min-width: 24px; height: 24px; margin-top: 2px;">
+        <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+        <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+    </svg>
+    <div>
+        <strong style="color: #1c1b18; font-size: 15px;">{{ _("Enter your pricing below") }}</strong>
+        <p style="color: #5a5a58; margin: 4px 0 0; font-size: 14px; line-height: 1.5;">
+            {{ _("Review the requested items, update the <strong>Qty</strong> and <strong>Rate</strong> fields, then click <strong>Make Quotation</strong> to submit your quote.") }}
+        </p>
+    </div>
+</div>
+
 <div class="row">
     <div class="col-6">
         <div class="rfq-supplier">{{ doc.supplier }}</div>
