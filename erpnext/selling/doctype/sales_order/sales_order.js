@@ -18,6 +18,7 @@ frappe.ui.form.on("Sales Order", {
 			Project: "Project",
 			"Payment Entry": "Payment",
 			"Work Order": "Work Order",
+			"Production Plan": "Production Plan",
 		};
 		frm.add_fetch("customer", "tax_id", "tax_id");
 
@@ -715,29 +716,32 @@ frappe.ui.form.on("Sales Order", {
 		if (!frequency) {
 			frappe.throw(__("Please select a frequency for delivery schedule"));
 		}
-
 		if (!first_delivery_date) {
 			frappe.throw(__("Please enter the first delivery date"));
 		}
-
 		if (no_of_deliveries <= 0) {
 			frappe.throw(__("Please enter a valid number of deliveries"));
 		}
 
+		const month_mapper = {
+			Monthly: 1,
+			Quarterly: 3,
+			"Half Yearly": 6,
+			Yearly: 12,
+		};
+
 		frm.schedule_dialog.fields_dict.delivery_schedule.df.data = [];
 		let qty_to_deliver = row.qty;
 		let qty_per_delivery = qty_to_deliver / no_of_deliveries;
-		for (let i = 0; i < no_of_deliveries; i++) {
-			let qty = qty_per_delivery;
-			if (must_be_whole_number) {
-				qty = cint(qty);
-			}
 
-			if (i === no_of_deliveries - 1) {
-				// Last delivery, adjust the quantity to deliver the remaining amount
+		for (let i = 0; i < no_of_deliveries; i++) {
+			let qty;
+			const is_last = i === no_of_deliveries - 1;
+
+			if (is_last) {
 				qty = qty_to_deliver;
-				qty_to_deliver = 0;
 			} else {
+				qty = must_be_whole_number ? cint(qty_per_delivery) : qty_per_delivery;
 				qty_to_deliver -= qty;
 			}
 
@@ -746,20 +750,15 @@ frappe.ui.form.on("Sales Order", {
 				qty: qty,
 			});
 
-			if (frequency === "Weekly") {
-				first_delivery_date = frappe.datetime.add_days(first_delivery_date, i + 1 * 7);
-			} else {
-				let month_mapper = {
-					Monthly: 1,
-					Quarterly: 3,
-					Half_Yearly: 6,
-					Yearly: 12,
-				};
-
-				first_delivery_date = frappe.datetime.add_months(
-					first_delivery_date,
-					month_mapper[frequency] * i + 1
-				);
+			if (!is_last) {
+				if (frequency === "Weekly") {
+					first_delivery_date = frappe.datetime.add_days(first_delivery_date, 7);
+				} else {
+					first_delivery_date = frappe.datetime.add_months(
+						first_delivery_date,
+						month_mapper[frequency]
+					);
+				}
 			}
 		}
 
@@ -1059,6 +1058,14 @@ erpnext.selling.SalesOrderController = class SalesOrderController extends erpnex
 								__("Create")
 							);
 						}
+
+						if (frappe.model.can_create("Production Plan") && !doc.is_subcontracted) {
+							this.frm.add_custom_button(
+								__("Production Plan"),
+								() => this.make_production_plan(),
+								__("Create")
+							);
+						}
 					}
 
 					// sales invoice
@@ -1339,6 +1346,13 @@ erpnext.selling.SalesOrderController = class SalesOrderController extends erpnex
 		});
 	}
 
+	make_production_plan() {
+		frappe.model.open_mapped_doc({
+			method: "erpnext.selling.doctype.sales_order.sales_order.make_production_plan",
+			frm: this.frm,
+		});
+	}
+
 	order_type() {
 		this.toggle_delivery_date();
 	}
@@ -1389,6 +1403,7 @@ erpnext.selling.SalesOrderController = class SalesOrderController extends erpnex
 
 	make_raw_material_request_dialog(r) {
 		var me = this;
+		r.message.forEach((item) => (item.__checked = 1));
 		var fields = [
 			{ fieldtype: "Check", fieldname: "include_exploded_items", label: __("Include Exploded Items") },
 			{
@@ -1399,7 +1414,8 @@ erpnext.selling.SalesOrderController = class SalesOrderController extends erpnex
 			{
 				fieldtype: "Table",
 				fieldname: "items",
-				description: __("Select BOM, Qty and For Warehouse"),
+				description: __("Finished Goods"),
+				cannot_delete_rows: true,
 				fields: [
 					{
 						fieldtype: "Read Only",

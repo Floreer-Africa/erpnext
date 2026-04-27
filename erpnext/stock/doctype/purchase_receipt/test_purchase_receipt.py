@@ -5446,6 +5446,70 @@ class TestPurchaseReceipt(ERPNextTestSuite):
 			self.assertEqual(pr.total_qty, 12)
 			self.assertEqual(pr.total, 120)
 
+	def test_different_exchange_rate_in_pr_and_pi(self):
+		from erpnext.accounts.doctype.account.test_account import create_account
+
+		original_value = frappe.db.get_single_value(
+			"Buying Settings", "set_landed_cost_based_on_purchase_invoice_rate"
+		)
+
+		frappe.db.set_single_value("Buying Settings", "set_landed_cost_based_on_purchase_invoice_rate", 1)
+
+		party_account = create_account(
+			account_name="USD Party Account Creditors",
+			parent_account="Accounts Payable - TCP1",
+			account_type="Payable",
+			company="_Test Company with perpetual inventory",
+			account_currency="USD",
+		)
+
+		supplier = create_supplier(
+			supplier_name="_Test USD Supplier New 1", default_currency="USD", party_account=party_account
+		).name
+		item_code = make_item("Test Item for Different Exchange Rate", {"is_stock_item": 1}).name
+
+		pr = make_purchase_receipt(
+			item_code=item_code,
+			qty=1,
+			currency="USD",
+			conversion_rate=80,
+			rate=100,
+			company="_Test Company with perpetual inventory",
+			warehouse=frappe.get_value(
+				"Warehouse", {"company": "_Test Company with perpetual inventory"}, "name"
+			),
+			supplier=supplier,
+		)
+
+		self.assertEqual(pr.currency, "USD")
+		self.assertEqual(pr.conversion_rate, 80)
+
+		gl_entries = get_gl_entries(pr.doctype, pr.name)
+		self.assertTrue(len(gl_entries) == 2)
+		for row in gl_entries:
+			amount = row.credit or row.debit
+			self.assertEqual(amount, 8000.0)
+
+		pi = make_purchase_invoice(pr.name)
+		pi.conversion_rate = 90
+		pi.currency = "USD"
+
+		pi.save()
+		pi.submit()
+
+		gl_entries = get_gl_entries(pi.doctype, pi.name)
+		self.assertTrue(len(gl_entries) == 2)
+
+		accounts = ["USD Party Account Creditors - TCP1", "Stock Received But Not Billed - TCP1"]
+		for row in gl_entries:
+			amount = row.credit or row.debit
+			self.assertEqual(amount, 9000.0)
+			self.assertTrue(row.account in accounts)
+
+		frappe.db.set_single_value(
+			"Buying Settings", "set_landed_cost_based_on_purchase_invoice_rate", original_value
+		)
+
 
 def prepare_data_for_internal_transfer():
 	from erpnext.accounts.doctype.sales_invoice.test_sales_invoice import create_internal_supplier
@@ -5615,6 +5679,9 @@ def make_purchase_receipt(**args):
 	pr.is_return = args.is_return
 	pr.return_against = args.return_against
 	pr.apply_putaway_rule = args.apply_putaway_rule
+
+	if args.get("conversion_rate") is not None:
+		pr.conversion_rate = args.conversion_rate
 
 	qty = args.qty if args.qty is not None else 5
 	rejected_qty = args.rejected_qty or 0

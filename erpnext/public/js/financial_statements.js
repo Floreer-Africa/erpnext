@@ -230,7 +230,10 @@ erpnext.financial_statements = {
 
 		value = default_formatter(value, row, column, data);
 
-		if (data && !data.parent_account && !data.parent_section) {
+		if (
+			data &&
+			((!data.parent_account && !data.parent_section) || data.is_group_account || data.is_group)
+		) {
 			value = $(`<span>${value}</span>`);
 
 			var $value = $(value).css("font-weight", "bold");
@@ -452,6 +455,7 @@ function get_filters() {
 			label: __("Currency"),
 			fieldtype: "Select",
 			options: erpnext.get_presentation_currency_list(),
+			depends_on: "eval: !doc.report_template",
 		},
 		{
 			fieldname: "cost_center",

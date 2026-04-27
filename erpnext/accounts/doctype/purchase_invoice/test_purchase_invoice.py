@@ -350,6 +350,12 @@ class TestPurchaseInvoice(ERPNextTestSuite, StockTestMixin):
 			make_purchase_invoice as create_purchase_invoice,
 		)
 
+		original_value = frappe.db.get_single_value(
+			"Buying Settings", "set_landed_cost_based_on_purchase_invoice_rate"
+		)
+
+		frappe.db.set_single_value("Buying Settings", "set_landed_cost_based_on_purchase_invoice_rate", 0)
+
 		pr = make_purchase_receipt(
 			company="_Test Company with perpetual inventory",
 			warehouse="Stores - TCP1",
@@ -368,13 +374,18 @@ class TestPurchaseInvoice(ERPNextTestSuite, StockTestMixin):
 
 		# fetching the latest GL Entry with exchange gain and loss account account
 		amount = frappe.db.get_value(
-			"GL Entry", {"account": exchange_gain_loss_account, "voucher_no": pi.name}, "credit"
+			"GL Entry", {"account": exchange_gain_loss_account, "voucher_no": pi.name}, "debit"
 		)
+
 		discrepancy_caused_by_exchange_rate_diff = abs(
 			pi.items[0].base_net_amount - pr.items[0].base_net_amount
 		)
 
 		self.assertEqual(discrepancy_caused_by_exchange_rate_diff, amount)
+
+		frappe.db.set_single_value(
+			"Buying Settings", "set_landed_cost_based_on_purchase_invoice_rate", original_value
+		)
 
 	def test_purchase_invoice_with_exchange_rate_difference_for_non_stock_item(self):
 		from erpnext.stock.doctype.purchase_receipt.purchase_receipt import (
@@ -2245,9 +2256,9 @@ class TestPurchaseInvoice(ERPNextTestSuite, StockTestMixin):
 
 	def test_repost_accounting_entries(self):
 		# update repost settings
-		settings = frappe.get_doc("Repost Accounting Ledger Settings")
-		if not [x for x in settings.allowed_types if x.document_type == "Purchase Invoice"]:
-			settings.append("allowed_types", {"document_type": "Purchase Invoice", "allowed": True})
+		settings = frappe.get_doc("Accounts Settings")
+		if "Purchase Invoice" not in [x.document_type for x in settings.repost_allowed_types]:
+			settings.append("repost_allowed_types", {"document_type": "Purchase Invoice"})
 		settings.save()
 
 		pi = make_purchase_invoice(
