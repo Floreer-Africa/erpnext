@@ -562,7 +562,14 @@ class PurchaseReceipt(BuyingController):
 				else flt(item.net_amount, item.precision("net_amount"))
 			)
 
-			outgoing_amount = item.qty * item.base_net_rate
+			outgoing_amount = (
+				flt((item.base_net_amount / item.received_qty) * item.qty, item.precision("base_net_amount"))
+				if item.received_qty
+				and frappe.get_single_value(
+					"Buying Settings", "bill_for_rejected_quantity_in_purchase_invoice"
+				)
+				else item.base_net_amount
+			)
 			if self.is_internal_transfer() and item.valuation_rate:
 				outgoing_amount = abs(get_stock_value_difference(self.name, item.name, item.from_warehouse))
 				credit_amount = outgoing_amount
@@ -717,6 +724,9 @@ class PurchaseReceipt(BuyingController):
 					self.get_company_default("default_expense_account", ignore_validation=True)
 					or stock_asset_rbnb
 				)
+
+				if self.is_return and item.expense_account:
+					loss_account = item.expense_account
 
 				cost_center = item.cost_center or frappe.get_cached_value(
 					"Company", self.company, "cost_center"
