@@ -215,6 +215,7 @@ website_route_rules = [
 	},
 	{"from_route": "/project", "to_route": "Project"},
 	{"from_route": "/tasks", "to_route": "Task"},
+	{"from_route": "/banking/<path:app_path>", "to_route": "banking"},
 ]
 
 standard_navbar_items = [
@@ -340,6 +341,14 @@ period_closing_doctypes = [
 	"Subcontracting Receipt",
 ]
 
+pre_submit_validation_doctypes = [
+	"Sales Invoice",
+	"Purchase Invoice",
+	"Delivery Note",
+	"Purchase Receipt",
+	"Sales Order",
+]
+
 doc_events = {
 	"*": {
 		"validate": [
@@ -349,6 +358,9 @@ doc_events = {
 	},
 	tuple(period_closing_doctypes): {
 		"validate": "erpnext.accounts.doctype.accounting_period.accounting_period.validate_accounting_period_on_doc_save",
+	},
+	tuple(pre_submit_validation_doctypes): {
+		"validate": "erpnext.accounts.utils.pre_submit_validation",
 	},
 	"Stock Entry": {
 		"on_submit": "erpnext.stock.doctype.material_request.material_request.update_completed_and_requested_qty",
@@ -456,6 +468,7 @@ scheduler_events = {
 		"erpnext.projects.doctype.project.project.project_status_update_reminder",
 		"erpnext.erpnext_integrations.doctype.plaid_settings.plaid_settings.automatic_synchronization",
 		"erpnext.utilities.doctype.video.video.update_youtube_data",
+		"erpnext.accounts.doctype.bank_transaction_rule.bank_transaction_rule.scheduler_run_rule_evaluation",
 	],
 	"daily": [],
 	"daily_long": [],

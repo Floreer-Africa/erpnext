@@ -88,7 +88,6 @@ class PurchaseReceipt(BuyingController):
 		instructions: DF.SmallText | None
 		inter_company_reference: DF.Link | None
 		is_internal_supplier: DF.Check
-		is_old_subcontracting_flow: DF.Check
 		is_return: DF.Check
 		is_subcontracted: DF.Check
 		item_wise_tax_details: DF.Table[ItemWiseTaxDetail]
@@ -149,6 +148,7 @@ class PurchaseReceipt(BuyingController):
 		taxes_and_charges_deducted: DF.Currency
 		tc_name: DF.Link | None
 		terms: DF.TextEditor | None
+		title: DF.Data | None
 		total: DF.Currency
 		total_net_weight: DF.Float
 		total_qty: DF.Float
@@ -562,14 +562,7 @@ class PurchaseReceipt(BuyingController):
 				else flt(item.net_amount, item.precision("net_amount"))
 			)
 
-			outgoing_amount = (
-				flt((item.base_net_amount / item.received_qty) * item.qty, item.precision("base_net_amount"))
-				if item.received_qty
-				and frappe.get_single_value(
-					"Buying Settings", "bill_for_rejected_quantity_in_purchase_invoice"
-				)
-				else item.base_net_amount
-			)
+			outgoing_amount = item.base_net_amount
 			if self.is_internal_transfer() and item.valuation_rate:
 				outgoing_amount = abs(get_stock_value_difference(self.name, item.name, item.from_warehouse))
 				credit_amount = outgoing_amount

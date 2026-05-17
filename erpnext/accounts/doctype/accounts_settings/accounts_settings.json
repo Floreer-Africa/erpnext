@@ -21,6 +21,7 @@
   "enable_common_party_accounting",
   "allow_multi_currency_invoices_against_single_party_account",
   "confirm_before_resetting_posting_date",
+  "preview_mode",
   "analytics_section",
   "enable_accounting_dimensions",
   "column_break_vtnr",
@@ -105,6 +106,8 @@
   "banking_section",
   "enable_party_matching",
   "enable_fuzzy_matching",
+  "transfer_match_days",
+  "automatically_run_rules_on_unreconciled_transactions",
   "payment_request_section",
   "create_pr_in_draft_status",
   "budget_section",
@@ -707,6 +710,21 @@
    "label": "Fetch Payment Schedule In Payment Request"
   },
   {
+   "default": "3",
+   "description": "Number of days to consider for matching transfers across bank accounts",
+   "fieldname": "transfer_match_days",
+   "fieldtype": "Int",
+   "label": "Match transfers within 'N' days",
+   "non_negative": 1
+  },
+  {
+   "default": "1",
+   "description": "If enabled, rule matching algorithm will run every hour",
+   "fieldname": "automatically_run_rules_on_unreconciled_transactions",
+   "fieldtype": "Check",
+   "label": "Automatically run rules on unreconciled transactions"
+  },
+  {
    "fieldname": "repost_section",
    "fieldtype": "Section Break",
    "label": "Repost"
@@ -716,6 +734,13 @@
    "fieldtype": "Table",
    "label": "Allowed Doctypes",
    "options": "Repost Allowed Types"
+  },
+  {
+   "default": "0",
+   "description": "Runs a preview check on save before submission without making any actual changes.",
+   "fieldname": "preview_mode",
+   "fieldtype": "Check",
+   "label": "Preview Mode"
   }
  ],
  "grid_page_length": 50,
@@ -724,7 +749,7 @@
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2026-04-13 15:30:28.729627",
+ "modified": "2026-04-22 01:38:42.418238",
  "modified_by": "Administrator",
  "module": "Accounts",
  "name": "Accounts Settings",

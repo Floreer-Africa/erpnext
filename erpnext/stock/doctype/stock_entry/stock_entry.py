@@ -128,7 +128,6 @@ class StockEntry(StockController, SubcontractingInwardController):
 		process_loss_percentage: DF.Percent
 		process_loss_qty: DF.Float
 		project: DF.Link | None
-		purchase_order: DF.Link | None
 		purchase_receipt_no: DF.Link | None
 		purpose: DF.Literal[
 			"Material Issue",
@@ -173,16 +172,7 @@ class StockEntry(StockController, SubcontractingInwardController):
 
 	def __init__(self, *args, **kwargs):
 		super().__init__(*args, **kwargs)
-		if self.purchase_order:
-			self.subcontract_data = frappe._dict(
-				{
-					"order_doctype": "Purchase Order",
-					"order_field": "purchase_order",
-					"rm_detail_field": "po_detail",
-					"order_supplied_items_field": "Purchase Order Item Supplied",
-				}
-			)
-		elif self.subcontracting_inward_order:
+		if self.subcontracting_inward_order:
 			self.subcontract_data = frappe._dict(
 				{
 					"order_doctype": "Subcontracting Inward Order",
@@ -247,13 +237,11 @@ class StockEntry(StockController, SubcontractingInwardController):
 		self.set_transfer_qty()
 		self.validate_uom_is_integer("uom", "qty")
 		self.validate_uom_is_integer("stock_uom", "transfer_qty")
-		self.validate_warehouse()
 		self.validate_warehouse_of_sabb()
 		self.validate_work_order()
 		self.validate_source_stock_entry()
 		self.validate_bom()
 		self.set_process_loss_qty()
-		self.validate_purchase_order()
 		self.validate_company_in_accounting_dimension()
 
 		if self.purpose in ("Manufacture", "Repack"):
@@ -263,6 +251,7 @@ class StockEntry(StockController, SubcontractingInwardController):
 			else:
 				self.validate_job_card_fg_item()
 
+		self.validate_warehouse()
 		self.validate_with_material_request()
 		self.validate_batch()
 		self.validate_inspection()
@@ -387,6 +376,9 @@ class StockEntry(StockController, SubcontractingInwardController):
 	def _set_serial_batch_for_disassembly_from_available_materials(self):
 		available_materials = get_available_materials(self.work_order, self)
 		for row in self.items:
+			if row.serial_no or row.batch_no or row.serial_and_batch_bundle:
+				continue
+
 			warehouse = row.s_warehouse or row.t_warehouse
 			materials = available_materials.get((row.item_code, warehouse))
 			if not materials:
@@ -853,16 +845,15 @@ class StockEntry(StockController, SubcontractingInwardController):
 				else:
 					frappe.throw(_("Target warehouse is mandatory for row {0}").format(d.idx))
 
-			if self.purpose == "Manufacture":
-				if has_bom:
-					if d.is_finished_item or d.type or d.is_legacy_scrap_item:
-						d.s_warehouse = None
-						if not d.t_warehouse:
-							frappe.throw(_("Target warehouse is mandatory for row {0}").format(d.idx))
-					else:
-						d.t_warehouse = None
-						if not d.s_warehouse:
-							frappe.throw(_("Source warehouse is mandatory for row {0}").format(d.idx))
+			if self.purpose in ["Manufacture", "Repack"]:
+				if d.is_finished_item or d.type or d.is_legacy_scrap_item:
+					d.s_warehouse = None
+					if not d.t_warehouse:
+						frappe.throw(_("Target warehouse is mandatory for row {0}").format(d.idx))
+				else:
+					d.t_warehouse = None
+					if not d.s_warehouse:
+						frappe.throw(_("Source warehouse is mandatory for row {0}").format(d.idx))
 
 			if self.purpose == "Disassemble":
 				if has_bom:
@@ -1695,19 +1686,6 @@ class StockEntry(StockController, SubcontractingInwardController):
 			if d.bom_no and d.is_finished_item:
 				item_code = d.original_item or d.item_code
 				validate_bom_no(item_code, d.bom_no)
-
-	def validate_purchase_order(self):
-		if self.purpose == "Send to Subcontractor" and self.get("purchase_order"):
-			is_old_subcontracting_flow = frappe.db.get_value(
-				"Purchase Order", self.purchase_order, "is_old_subcontracting_flow"
-			)
-
-			if not is_old_subcontracting_flow:
-				frappe.throw(
-					_("Please select Subcontracting Order instead of Purchase Order {0}").format(
-						self.purchase_order
-					)
-				)
 
 	def validate_closed_subcontracting_order(self):
 		order = self.get("subcontracting_order") or self.get("subcontracting_inward_order")
