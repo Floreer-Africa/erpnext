@@ -161,6 +161,7 @@ class TestItem(ERPNextTestSuite):
 					"conversion_factor": 1,
 					"price_list_uom_dependant": 1,
 					"ignore_pricing_rule": 1,
+					"qty": 1,
 				}
 			)
 		)
@@ -390,8 +391,9 @@ class TestItem(ERPNextTestSuite):
 				},
 			)
 
-		self.assertTrue(
-			"belong to company" in str(ve.exception).lower(),
+		self.assertIn(
+			"belong to company",
+			str(ve.exception).lower(),
 			msg="Mismatching company entities in item defaults should not be allowed.",
 		)
 
@@ -540,6 +542,7 @@ class TestItem(ERPNextTestSuite):
 		with self.assertRaises(DataValidationError):
 			frappe.rename_doc("Item", "Test Item Bundle Item 1", "Test Item Bundle Item 2", merge=True)
 
+		bundle1.cancel()
 		bundle1.delete()
 		frappe.rename_doc("Item", "Test Item Bundle Item 1", "Test Item Bundle Item 2", merge=True)
 
@@ -675,7 +678,7 @@ class TestItem(ERPNextTestSuite):
 			self.assertIsInstance(timestamp, int)
 			self.assertTrue(one_year_ago <= timestamp <= now)
 			self.assertIsInstance(count, int)
-			self.assertTrue(count >= 0)
+			self.assertGreaterEqual(count, 0)
 
 	def test_index_creation(self):
 		"check if index is getting created in db"
@@ -848,7 +851,7 @@ class TestItem(ERPNextTestSuite):
 		for _row in range(3):
 			item.append("customer_items", {"ref_code": frappe.generate_hash("", 120)})
 		item.save()
-		self.assertTrue(len(item.customer_code) > 140)
+		self.assertGreater(len(item.customer_code), 140)
 
 	def test_update_is_stock_item(self):
 		# Step - 1: Create an Item with Maintain Stock enabled
@@ -860,18 +863,21 @@ class TestItem(ERPNextTestSuite):
 		item.reload()
 		self.assertEqual(item.is_stock_item, 0)
 
-		# Step - 3: Create Product Bundle
+		# Step - 3: Create (and submit) an active Product Bundle for the item
+		component = make_item(properties={"is_stock_item": 1}).name
 		pb = frappe.new_doc("Product Bundle")
 		pb.new_item_code = item.name
-		pb.flags.ignore_mandatory = True
-		pb.save()
+		pb.append("items", {"item_code": component, "qty": 1})
+		pb.insert()
+		pb.submit()
 
 		# Step - 4: Try to enable Maintain Stock, should throw a validation error
 		item.is_stock_item = 1
 		self.assertRaises(frappe.ValidationError, item.save)
 		item.reload()
 
-		# Step - 5: Delete Product Bundle
+		# Step - 5: Cancel & delete Product Bundle
+		pb.cancel()
 		pb.delete()
 
 		# Step - 6: Again try to enable Maintain Stock
@@ -889,7 +895,7 @@ class TestItem(ERPNextTestSuite):
 		data = item_query("Item", "Test Item", "", 0, 20, filters={"item_name": "Test Item"}, as_dict=True)
 		self.assertEqual(data[0].name, item.name)
 		self.assertEqual(data[0].item_name, item.item_name)
-		self.assertTrue("description" not in data[0])
+		self.assertNotIn("description", data[0])
 
 		make_property_setter(
 			"Item", None, "search_fields", "item_name, description", "Data", for_doctype="Doctype"
@@ -898,7 +904,7 @@ class TestItem(ERPNextTestSuite):
 		self.assertEqual(data[0].name, item.name)
 		self.assertEqual(data[0].item_name, item.item_name)
 		self.assertEqual(data[0].description, item.description)
-		self.assertTrue("description" in data[0])
+		self.assertIn("description", data[0])
 
 	def test_group_warehouse_for_reorder_item(self):
 		from erpnext.stock.doctype.warehouse.test_warehouse import create_warehouse
@@ -955,8 +961,9 @@ class TestItem(ERPNextTestSuite):
 				}
 			).insert()
 
-		self.assertTrue(
-			"must be same as in Template" in str(ve.exception),
+		self.assertIn(
+			"must be same as in Template",
+			str(ve.exception),
 			msg="Different Variant UOM should not be allowed when `allow_different_uom` is disabled.",
 		)
 
