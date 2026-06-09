@@ -79,7 +79,6 @@ class Item(Document):
 		brand: DF.Link | None
 		country_of_origin: DF.Link | None
 		create_new_batch: DF.Check
-		customer: DF.Link | None
 		customer_code: DF.SmallText | None
 		customer_items: DF.Table[ItemCustomerDetail]
 		customs_tariff_number: DF.Link | None
@@ -713,8 +712,10 @@ class Item(Document):
 
 	def validate_duplicate_product_bundles_before_merge(self, old_name, new_name):
 		"Block merge if both old and new items have product bundles."
-		old_bundle = frappe.get_value("Product Bundle", filters={"new_item_code": old_name, "disabled": 0})
-		new_bundle = frappe.get_value("Product Bundle", filters={"new_item_code": new_name, "disabled": 0})
+		from erpnext.selling.doctype.product_bundle.product_bundle import get_active_product_bundle
+
+		old_bundle = get_active_product_bundle(old_name)
+		new_bundle = get_active_product_bundle(new_name)
 
 		if old_bundle and new_bundle:
 			bundle_link = get_link_to_form("Product Bundle", old_bundle)
@@ -889,8 +890,13 @@ class Item(Document):
 					if disabled:
 						frappe.throw(_("Attribute {0} is disabled.").format(frappe.bold(d.attribute)))
 
-					if not numeric_values and not frappe.db.exists(
-						"Item Attribute Value", {"parent": d.attribute, "attribute_value": d.attribute_value}
+					if (
+						not numeric_values
+						and d.attribute_value
+						and not frappe.db.exists(
+							"Item Attribute Value",
+							{"parent": d.attribute, "attribute_value": d.attribute_value},
+						)
 					):
 						frappe.throw(
 							_("Attribute Value {0} is not valid for the selected attribute {1}.").format(
@@ -1142,7 +1148,7 @@ class Item(Document):
 
 			if doctype in ("Product Bundle", "BOM"):
 				if doctype == "Product Bundle":
-					filters = {"new_item_code": self.name}
+					filters = {"new_item_code": self.name, "is_active": 1, "docstatus": 1}
 					fieldname = "new_item_code as docname"
 				else:
 					filters = {"item": self.name, "docstatus": 1}
@@ -1540,3 +1546,41 @@ def get_child_warehouses(warehouse):
 	from erpnext.stock.doctype.warehouse.warehouse import get_child_warehouses
 
 	return get_child_warehouses(warehouse)
+
+
+@frappe.whitelist()
+def get_item_prices(item_code: str):
+	"""Fetch valid item prices for the item prices tab."""
+	if not frappe.has_permission("Item Price", "read"):
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
+	today = getdate()
+
+	ItemPrice = frappe.qb.DocType("Item Price")
+
+	prices = (
+		frappe.qb.from_(ItemPrice)
+		.select(
+			ItemPrice.name,
+			ItemPrice.price_list,
+			ItemPrice.price_list_rate,
+			ItemPrice.currency,
+			ItemPrice.uom,
+			ItemPrice.customer,
+			ItemPrice.supplier,
+			ItemPrice.buying,
+			ItemPrice.selling,
+			ItemPrice.valid_upto,
+		)
+		.where(ItemPrice.item_code == item_code)
+		.where(ItemPrice.docstatus != 2)
+		.where((ItemPrice.valid_upto.isnull()) | (ItemPrice.valid_upto >= today))
+		.orderby(ItemPrice.price_list)
+		.limit(11)
+		.run(as_dict=True)
+	)
+
+	has_more = len(prices) == 11
+	return {
+		"prices": prices[:10],
+		"has_more": has_more,
+	}
