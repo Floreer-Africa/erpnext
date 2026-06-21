@@ -165,6 +165,80 @@ class TestPackedItem(ERPNextTestSuite):
 		self.assertEqual(so.items[0].product_bundle, v1)
 		self.assertEqual(sorted(pi.item_code for pi in so.packed_items), sorted(self.bundle_items))
 
+	def test_disabled_bundle_blocks_transaction(self):
+		"A row that explicitly references a disabled version cannot be saved."
+		from erpnext.selling.doctype.product_bundle.product_bundle import get_active_product_bundle
+
+		version = get_active_product_bundle(self.bundle)
+		so = make_sales_order(item_code=self.bundle, qty=1, warehouse=self.warehouse, do_not_submit=True)
+		self.assertEqual(so.items[0].product_bundle, version)
+
+		frappe.db.set_value("Product Bundle", version, "disabled", 1)
+		self.assertRaises(frappe.ValidationError, so.save)
+
+	def test_disabled_bundle_is_not_packed(self):
+		"Without an explicit version, a disabled bundle is not treated as a bundle at all."
+		from erpnext.selling.doctype.product_bundle.product_bundle import get_active_product_bundle
+
+		version = get_active_product_bundle(self.bundle2)
+		frappe.db.set_value("Product Bundle", version, "disabled", 1)
+
+		so = make_sales_order(item_code=self.bundle2, qty=1, warehouse=self.warehouse, do_not_submit=True)
+		self.assertEqual(so.items[0].is_product_bundle, 0)
+		self.assertFalse(so.items[0].product_bundle)
+		self.assertFalse(so.get("packed_items"))
+
+	def test_get_items_from_product_bundle_endpoint(self):
+		"The buying dialog passes the chosen version by document name (legacy: parent item code)."
+		import json
+
+		from erpnext.selling.doctype.product_bundle.product_bundle import get_active_product_bundle
+		from erpnext.stock.doctype.packed_item.packed_item import get_items_from_product_bundle
+
+		ctx = {
+			"quantity": 2,
+			"doctype": "Purchase Order",
+			"parenttype": "Purchase Order",
+			"company": "_Test Company",
+			"currency": "INR",
+			"conversion_rate": 1,
+			"transaction_date": nowdate(),
+		}
+
+		# by document name, as the buying dialog sends it (bundle names are PB-prefixed
+		# since versioning, so they no longer double as the parent item code)
+		version = get_active_product_bundle(self.bundle)
+		items = get_items_from_product_bundle(json.dumps({"product_bundle": version, **ctx}))
+		self.assertEqual(sorted(i.item_code for i in items), sorted(self.bundle_items))
+		self.assertEqual([i.qty for i in items], [4, 4])
+
+		# legacy contract: the parent item code resolves to its active version
+		items = get_items_from_product_bundle(json.dumps({"item_code": self.bundle, **ctx}))
+		self.assertEqual(sorted(i.item_code for i in items), sorted(self.bundle_items))
+
+		# an unsubmitted version is rejected
+		draft = frappe.get_doc(
+			{
+				"doctype": "Product Bundle",
+				"new_item_code": make_item(properties={"is_stock_item": 0}).name,
+				"items": [{"item_code": self.bundle_items[0], "qty": 1}],
+			}
+		).insert()
+		self.assertRaises(
+			frappe.ValidationError,
+			get_items_from_product_bundle,
+			json.dumps({"product_bundle": draft.name, **ctx}),
+		)
+
+		# a disabled version is rejected
+		frappe.db.set_value("Product Bundle", version, "disabled", 1)
+		self.addCleanup(frappe.db.set_value, "Product Bundle", version, "disabled", 0)
+		self.assertRaises(
+			frappe.ValidationError,
+			get_items_from_product_bundle,
+			json.dumps({"product_bundle": version, **ctx}),
+		)
+
 	@ERPNextTestSuite.change_settings("Selling Settings", {"allow_multiple_items": 1})
 	def test_recurring_bundle_item(self):
 		"Test impact on packed items if same bundle item is added and removed."

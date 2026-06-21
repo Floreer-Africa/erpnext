@@ -912,10 +912,23 @@ class JobCard(Document):
 				)
 			)
 
+		self.validate_not_on_hold()
 		self.validate_time_logs_present()
 		self.validate_completed_qty_matches_for_quantity()
 
+	def validate_not_on_hold(self):
+		if self.is_paused:
+			frappe.throw(
+				_(
+					"Cannot submit Job Card {0} while it is On Hold. Please resume and complete the job before submission."
+				).format(get_link_to_form("Job Card", self.name)),
+				title=_("Job Card On Hold"),
+			)
+
 	def validate_time_logs_present(self):
+		if self.track_semi_finished_goods and self.is_subcontracted:
+			return
+
 		if not self.time_logs:
 			frappe.throw(
 				_("Time logs are required for {0} {1}").format(
@@ -930,6 +943,9 @@ class JobCard(Document):
 					)
 
 	def validate_completed_qty_matches_for_quantity(self):
+		if self.track_semi_finished_goods and self.is_subcontracted:
+			return
+
 		precision = self.precision("total_completed_qty")
 		total_completed_qty = flt(
 			flt(self.total_completed_qty, precision)
@@ -1637,7 +1653,7 @@ class JobCard(Document):
 		)
 
 	def populate_manufacture_stock_entry(self, ste):
-		from erpnext.stock.doctype.stock_entry.stock_entry_handler.manufacturing import ManufactureStockEntry
+		from erpnext.stock.doctype.stock_entry.services.manufacturing import ManufactureStockEntry
 
 		ste.make_stock_entry()
 		ste.stock_entry.flags.ignore_mandatory = True

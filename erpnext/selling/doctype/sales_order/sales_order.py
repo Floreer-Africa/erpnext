@@ -23,8 +23,8 @@ from erpnext.manufacturing.doctype.blanket_order.blanket_order import (
 )
 from erpnext.selling.doctype.customer.customer import check_credit_limit
 from erpnext.selling.doctype.sales_order.services.delivery_schedule import DeliveryScheduleService
+from erpnext.selling.doctype.sales_order.services.reservation import SalesOrderStockReservation
 from erpnext.selling.doctype.sales_order.services.status import StatusService
-from erpnext.selling.doctype.sales_order.services.stock_reservation import StockReservationService
 from erpnext.selling.doctype.sales_order.services.subcontracting import SubcontractingService
 from erpnext.stock.doctype.packed_item.packed_item import make_packing_list
 from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry import has_reserved_stock
@@ -226,7 +226,7 @@ class SalesOrder(SellingController):
 		self.validate_for_items()
 		self.validate_warehouse()
 		self.validate_drop_ship()
-		StockReservationService(self).validate_reserved_stock()
+		SalesOrderStockReservation(self).validate_reserved_stock()
 		self.validate_serial_no_based_delivery()
 		validate_against_blanket_order(self)
 		validate_inter_company_party(
@@ -248,7 +248,7 @@ class SalesOrder(SellingController):
 
 		self.reset_default_field_value("set_warehouse", "items", "warehouse")
 		if not self.get("is_subcontracted"):
-			StockReservationService(self).enable_auto_reserve_stock()
+			SalesOrderStockReservation(self).enable_auto_reserve_stock()
 
 	def set_has_unit_price_items(self):
 		"""
@@ -542,7 +542,7 @@ class SalesOrder(SellingController):
 		StatusService(self).update_status(status)
 
 	def update_reserved_qty(self, so_item_rows=None):
-		StockReservationService(self).update_reserved_qty(so_item_rows)
+		SalesOrderStockReservation(self).update_reserved_qty(so_item_rows)
 
 	def on_update_after_submit(self):
 		self.calculate_commission()
@@ -652,7 +652,7 @@ class SalesOrder(SellingController):
 	@frappe.whitelist()
 	def has_unreserved_stock(self, table_name: str = "items") -> dict:
 		"""Returns unreserved qty per item if there is any unreserved item in the Sales Order."""
-		return StockReservationService(self).has_unreserved_stock(table_name)
+		return SalesOrderStockReservation(self).has_unreserved_stock(table_name)
 
 	@frappe.whitelist()
 	def create_stock_reservation_entries(
@@ -662,14 +662,14 @@ class SalesOrder(SellingController):
 		notify: bool = True,
 	) -> None:
 		"""Creates Stock Reservation Entries for Sales Order Items."""
-		StockReservationService(self).create_stock_reservation_entries(
+		SalesOrderStockReservation(self).create_stock_reservation_entries(
 			items_details, from_voucher_type, notify
 		)
 
 	@frappe.whitelist()
 	def cancel_stock_reservation_entries(self, sre_list: list | None = None, notify: bool = True) -> None:
 		"""Cancel Stock Reservation Entries for Sales Order Items."""
-		StockReservationService(self).cancel_stock_reservation_entries(sre_list, notify)
+		SalesOrderStockReservation(self).cancel_stock_reservation_entries(sre_list, notify)
 
 	def set_missing_values(self, for_validate=False):
 		super().set_missing_values(for_validate)
