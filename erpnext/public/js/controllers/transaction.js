@@ -201,7 +201,7 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 		}
 
 		if (this.frm.fields_dict["items"].grid.get_field("product_bundle")) {
-			// restrict the version picker to submitted Product Bundles of the row's item
+			// restrict the version picker to enabled, submitted Product Bundles of the row's item
 			this.frm.set_query("product_bundle", "items", function (doc, cdt, cdn) {
 				let row = locals[cdt][cdn];
 
@@ -209,6 +209,7 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 					filters: {
 						new_item_code: row.item_code,
 						docstatus: 1,
+						disabled: 0,
 					},
 				};
 			});
@@ -403,11 +404,13 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 			);
 		}
 
-		const inspection_type = ["Purchase Receipt", "Purchase Invoice", "Subcontracting Receipt"].includes(
-			this.frm.doc.doctype
-		)
-			? "Incoming"
-			: "Outgoing";
+		const incoming_doctypes = ["Purchase Receipt", "Purchase Invoice", "Subcontracting Receipt"];
+		const incoming_purposes = ["Manufacture", "Material Receipt"];
+		const inspection_type =
+			incoming_doctypes.includes(this.frm.doc.doctype) ||
+			(this.frm.doc.doctype === "Stock Entry" && incoming_purposes.includes(this.frm.doc.purpose))
+				? "Incoming"
+				: "Outgoing";
 
 		let quality_inspection_field = this.frm.get_docfield("items", "quality_inspection");
 		quality_inspection_field.get_route_options_for_new_doc = function (row) {
@@ -2893,11 +2896,13 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 		];
 
 		const me = this;
-		const inspection_type = ["Purchase Receipt", "Purchase Invoice", "Subcontracting Receipt"].includes(
-			this.frm.doc.doctype
-		)
-			? "Incoming"
-			: "Outgoing";
+		const incoming_doctypes = ["Purchase Receipt", "Purchase Invoice", "Subcontracting Receipt"];
+		const incoming_purposes = ["Manufacture", "Material Receipt"];
+		const inspection_type =
+			incoming_doctypes.includes(this.frm.doc.doctype) ||
+			(this.frm.doc.doctype === "Stock Entry" && incoming_purposes.includes(this.frm.doc.purpose))
+				? "Incoming"
+				: "Outgoing";
 		const dialog = new frappe.ui.Dialog({
 			title: __("Select Items for Quality Inspection"),
 			size: "extra-large",
@@ -3003,11 +3008,9 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 		let method = "erpnext.accounts.doctype.payment_entry.payment_entry.get_payment_entry";
 		if (this.frm.doc.__onload && this.frm.doc.__onload.make_payment_via_journal_entry) {
 			if (["Sales Invoice", "Purchase Invoice"].includes(this.frm.doc.doctype)) {
-				method =
-					"erpnext.accounts.doctype.journal_entry.journal_entry.get_payment_entry_against_invoice";
+				method = "erpnext.accounts.doctype.journal_entry.mapper.get_payment_entry_against_invoice";
 			} else {
-				method =
-					"erpnext.accounts.doctype.journal_entry.journal_entry.get_payment_entry_against_order";
+				method = "erpnext.accounts.doctype.journal_entry.mapper.get_payment_entry_against_order";
 			}
 		}
 

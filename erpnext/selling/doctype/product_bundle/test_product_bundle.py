@@ -103,6 +103,38 @@ class TestProductBundle(ERPNextTestSuite):
 		bundle.items[0].qty = 99
 		self.assertRaises(frappe.exceptions.UpdateAfterSubmitError, bundle.save)
 
+	def test_disabled_bundle_is_not_resolved(self):
+		bundle = make_product_bundle(self.parent, ["_Test PB Child A"])
+
+		bundle.disabled = 1
+		bundle.save()
+		self.assertIsNone(get_active_product_bundle(self.parent))
+
+		# disabling parks the version without ceding the active slot, so re-enabling
+		# restores resolution without re-activation
+		self.assertEqual(frappe.db.get_value("Product Bundle", bundle.name, "is_active"), 1)
+		bundle.disabled = 0
+		bundle.save()
+		self.assertEqual(get_active_product_bundle(self.parent), bundle.name)
+
+	def test_item_where_used_report_shows_disabled_flag(self):
+		from erpnext.stock.report.item_where_used.item_where_used import execute
+
+		bundle = make_product_bundle(self.parent, ["_Test PB Child A"])
+		bundle.disabled = 1
+		bundle.save()
+
+		_, component_rows = execute({"item": "_Test PB Child A", "section": "Where Used"})
+		rows = [r for r in component_rows if r.document_name == bundle.name]
+		self.assertTrue(rows)
+		self.assertEqual(rows[0].disabled, 1)
+		self.assertEqual(rows[0].is_active, 1)
+
+		_, parent_rows = execute({"item": self.parent, "section": "References"})
+		rows = [r for r in parent_rows if r.document_name == bundle.name]
+		self.assertTrue(rows)
+		self.assertEqual(rows[0].disabled, 1)
+
 	def test_child_cannot_be_active_bundle(self):
 		make_product_bundle(self.parent, ["_Test PB Child A"])
 		outer = make_item("_Test PB Outer", {"is_stock_item": 0, "is_sales_item": 1}).name
