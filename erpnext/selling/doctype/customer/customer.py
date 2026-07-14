@@ -285,7 +285,12 @@ class Customer(TransactionBase):
 				self.db_set("mobile_no", self.mobile_no)
 				self.db_set("email_id", self.email_id)
 		elif self.customer_primary_contact:
-			frappe.set_value("Contact", self.customer_primary_contact, "is_primary_contact", 1)  # ensure
+			# frappe.set_value routes through the whitelisted client API, which re-imposes
+			# session permissions on the Contact — the caller's ignore_permissions lives on
+			# the Customer and does not propagate. Portal users cannot write their own
+			# Contact (All role is if_owner=1; the Contact is owned by Administrator or
+			# Guest), so this cascade raised PermissionError for every customer. (framework#113)
+			frappe.db.set_value("Contact", self.customer_primary_contact, "is_primary_contact", 1)
 
 	def create_primary_address(self):
 		from frappe.contacts.doctype.address.address import get_address_display
