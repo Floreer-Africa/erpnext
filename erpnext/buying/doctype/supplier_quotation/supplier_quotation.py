@@ -243,11 +243,17 @@ def get_list_context(context=None):
 
 
 def set_expired_status():
+	# PR-Foundry fork patch (framework#82): this frappe's Database.set_value
+	# signature is positional — set_value(dt, dn, field, val, ...); `dn` already
+	# accepts a filters dict for a bulk update. Upstream erpnext (develop) calls
+	# it with filters=/fieldname=/value= kwargs that don't exist here, so the
+	# daily scheduler TypeError'd. Use the positional form. Upstream-owned line —
+	# an erpnext sync can revert it; guarded by client_app.tests.test_supplier_quotation_expiry.
 	frappe.db.set_value(
 		"Supplier Quotation",
-		filters={"status": ["not in", ["Cancelled", "Stopped"]], "valid_till": ["<", nowdate()]},
-		fieldname="status",
-		value="Expired",
+		{"status": ["not in", ["Cancelled", "Stopped"]], "valid_till": ["<", nowdate()]},
+		"status",
+		"Expired",
 		update_modified=True,
 	)
 
