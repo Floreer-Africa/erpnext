@@ -297,11 +297,16 @@ class Customer(TransactionBase):
 			)  # ensure
 
 	def create_primary_address(self):
-		from frappe.contacts.doctype.address.address import get_address_display
+		from frappe.contacts.doctype.address.address import render_address
 
 		if self.flags.is_new_doc and self.get("address_line1"):
 			address = make_address(self)
-			address_display = get_address_display(address.name)
+			# render_address(check_permissions=False), not the whitelisted get_address_display:
+			# make_address() just created this Address with the caller's ignore_permissions, so a
+			# session-permission check on its display value is both wrong and a lockout risk on the
+			# same cascade path as the elif ensure below (framework#121, sibling of framework#113).
+			# Layered on top of canonical framework#84 — re-verify after any erpnext upstream-sync.
+			address_display = render_address(address.name, check_permissions=False)
 
 			self.db_set("customer_primary_address", address.name)
 			self.db_set("primary_address", address_display)
