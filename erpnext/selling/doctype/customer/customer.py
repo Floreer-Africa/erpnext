@@ -285,12 +285,16 @@ class Customer(TransactionBase):
 				self.db_set("mobile_no", self.mobile_no)
 				self.db_set("email_id", self.email_id)
 		elif self.customer_primary_contact:
-			# frappe.set_value routes through the whitelisted client API, which re-imposes
-			# session permissions on the Contact — the caller's ignore_permissions lives on
-			# the Customer and does not propagate. Portal users cannot write their own
-			# Contact (All role is if_owner=1; the Contact is owned by Administrator or
-			# Guest), so this cascade raised PermissionError for every customer. (framework#113)
-			frappe.db.set_value("Contact", self.customer_primary_contact, "is_primary_contact", 1)
+			# PR-Foundry/framework#84 (fork patch) — frappe.set_value is the
+			# permission-checking client API; during a webshop get_party() re-save a
+			# guest shopper hits PermissionError writing Contact/Address and the whole
+			# product grid 403s / blanks. frappe.db.set_value is a direct,
+			# permission-free "ensure" of the is-primary flag (no business logic, no
+			# validation needed). Upstream-owned — re-verify after any erpnext sync.
+			# Guarded by client_app.tests.test_customer_primary_ensure_permissionless.
+			frappe.db.set_value(
+				"Contact", self.customer_primary_contact, "is_primary_contact", 1
+			)  # ensure
 
 	def create_primary_address(self):
 		from frappe.contacts.doctype.address.address import get_address_display
@@ -302,7 +306,13 @@ class Customer(TransactionBase):
 			self.db_set("customer_primary_address", address.name)
 			self.db_set("primary_address", address_display)
 		elif self.customer_primary_address:
-			frappe.set_value("Address", self.customer_primary_address, "is_primary_address", 1)  # ensure
+			# framework#84 (fork patch) — see create_primary_contact above: a direct,
+			# permission-free ensure of the is-primary flag, so a guest browsing (the
+			# webshop get_party() re-save) never PermissionErrors on Address and
+			# blanks the product grid. Upstream-owned — re-verify after any erpnext sync.
+			frappe.db.set_value(
+				"Address", self.customer_primary_address, "is_primary_address", 1
+			)  # ensure
 
 	def update_lead_status(self):
 		"""If Customer created from Lead, update lead status to "Converted"
