@@ -468,7 +468,27 @@ class SalesOrder(SellingController):
 			update_coupon_code_count(self.coupon_code, "used")
 
 		if self.get("reserve_stock") and not self.get("is_subcontracted"):
-			self.create_stock_reservation_entries()
+			# Stock reservation reads Item stock (get_stock_balance -> hard
+			# frappe.has_permission("Item","read")) and inserts Stock Reservation
+			# Entries — both gated on DocTypes a Website User cannot access. When a
+			# trusted server flow (webshop `place_order`) submits the SO with
+			# ignore_permissions=True, the customer's session drives this back-office
+			# reservation and hits a bare PermissionError -> HTTP 403 -> redirect to
+			# /login at checkout. Reservation is a system-level inventory side effect
+			# of an already-authorised checkout, so run it with system authority while
+			# leaving the Sales Order itself owned by the customer. Scoped to trusted
+			# submits only — a desk user (ignore_permissions False) still goes through
+			# normal permission checks. Floreer vendored-fork patch (framework#127) —
+			# re-verify after any erpnext upstream-sync.
+			if self.flags.ignore_permissions and frappe.session.user != "Administrator":
+				_reserve_user = frappe.session.user
+				frappe.set_user("Administrator")
+				try:
+					self.create_stock_reservation_entries()
+				finally:
+					frappe.set_user(_reserve_user)
+			else:
+				self.create_stock_reservation_entries()
 
 	def on_cancel(self):
 		self.ignore_linked_doctypes = (
