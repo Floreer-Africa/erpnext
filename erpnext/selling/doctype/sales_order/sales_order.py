@@ -471,22 +471,33 @@ class SalesOrder(SellingController):
 			# Stock reservation reads Item stock (get_stock_balance -> hard
 			# frappe.has_permission("Item","read")) and inserts Stock Reservation
 			# Entries — both gated on DocTypes a Website User cannot access. When a
-			# trusted server flow (webshop `place_order`) submits the SO with
-			# ignore_permissions=True, the customer's session drives this back-office
-			# reservation and hits a bare PermissionError -> HTTP 403 -> redirect to
-			# /login at checkout. Reservation is a system-level inventory side effect
-			# of an already-authorised checkout, so run it with system authority while
-			# leaving the Sales Order itself owned by the customer. Scoped to trusted
-			# submits only — a desk user (ignore_permissions False) still goes through
-			# normal permission checks. Floreer vendored-fork patch (framework#127) —
-			# re-verify after any erpnext upstream-sync.
+			# trusted server flow (webshop `place_order` / RFQ auto-submit) submits
+			# the SO with ignore_permissions=True, the customer's session drives this
+			# back-office reservation.
+			#
+			# Running it INLINE here had two problems on the storefront checkout:
+			#   (1) the customer's session lacks Item/SRE permission -> PermissionError
+			#       -> HTTP 403 -> /login (the original framework#127 symptom), and
+			#   (2) it reads Item stock + inserts Stock Reservation Entries + holds Bin
+			#       locks ACROSS the Sales Order item insert, which intermittently
+			#       DEADLOCKED checkout (MariaDB 1213), making Place Order flaky.
+			#
+			# So for a trusted (ignore_permissions) submit, DEFER the reservation to a
+			# background job AFTER commit: the checkout transaction stays short and
+			# holds no reservation locks (no deadlock), and the SO is reserved a moment
+			# later with system authority — reservation is a soft, back-office inventory
+			# hold on an already-authorised order, so best-effort/async is acceptable
+			# for the weigh-then-invoice model. Desk submits (ignore_permissions False)
+			# still reserve inline under normal permission checks.
+			# Floreer vendored-fork patch (framework#127 + framework#131) — re-verify
+			# after any erpnext upstream-sync.
 			if self.flags.ignore_permissions and frappe.session.user != "Administrator":
-				_reserve_user = frappe.session.user
-				frappe.set_user("Administrator")
-				try:
-					self.create_stock_reservation_entries()
-				finally:
-					frappe.set_user(_reserve_user)
+				frappe.enqueue(
+					"erpnext.selling.doctype.sales_order.sales_order.reserve_stock_after_commit",
+					queue="short",
+					enqueue_after_commit=True,
+					sales_order=self.name,
+				)
 			else:
 				self.create_stock_reservation_entries()
 
@@ -706,6 +717,33 @@ class SalesOrder(SellingController):
 	@frappe.whitelist()
 	def create_delivery_schedule(self, child_row: dict | frappe._dict, schedules: str | list[dict]):
 		DeliveryScheduleService(self).create_delivery_schedule(child_row, schedules)
+
+
+def reserve_stock_after_commit(sales_order: str):
+	"""Create Stock Reservation Entries for a submitted Sales Order OFF the checkout
+	transaction (Floreer vendored-fork patch framework#131; extends framework#127).
+
+	Enqueued after commit from ``SalesOrder.on_submit`` for trusted storefront submits
+	so the checkout transaction holds no reservation (Bin / SRE) locks across the SO
+	item insert — the fix for the intermittent MariaDB 1213 deadlock that made Place
+	Order flaky. Runs as Administrator (reservation touches Item stock + Stock
+	Reservation Entries, back-office DocTypes the customer's session cannot access).
+	Best-effort: a failure is logged, never re-raised — the order is already placed
+	and stock is picked/weighed before invoicing.
+	"""
+	try:
+		doc = frappe.get_doc("Sales Order", sales_order)
+		if doc.docstatus != 1 or not doc.get("reserve_stock"):
+			return
+		if frappe.session.user != "Administrator":
+			frappe.set_user("Administrator")
+		doc.create_stock_reservation_entries()
+		frappe.db.commit()
+	except Exception:
+		frappe.log_error(
+			title="Deferred SO stock reservation failed",
+			message=f"Sales Order {sales_order}",
+		)
 
 
 def get_list_context(context=None):
