@@ -187,7 +187,7 @@ def get_entries(filters):
 	# doc_type / sales_person / item_group are handled separately below. Passing report
 	# controls (doc_type/from_date/to_date) as field filters makes the permission-checked
 	# query engine run a field-level perm check on non-fields -> PermissionError for any
-	# non–System-Manager role (e.g. Sales User).
+	# non-System-Manager role (e.g. Sales User).
 	# SPWTS-FORK-BACKPORT: PR-Foundry backport of upstream frappe/erpnext develop commits
 	# 3092c920ff + e0b0926dff (2026-07-02). framework#103. Re-verify this survives after any
 	# erpnext upstream-sync; guarded by client_app.tests.test_sales_person_wise_summary.
