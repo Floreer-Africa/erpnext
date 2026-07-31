@@ -497,6 +497,23 @@ class PaymentRequest(Document):
 			}
 		)
 
+	def on_payment_authorized(self, status=None):
+		"""Gateway settlement callback (payments-app contract). Every gateway
+		calls run_method('on_payment_authorized', status) on the reference
+		Payment Request after a successful charge, expecting it to create the
+		Payment Entry that clears the linked document. Upstream erpnext removed
+		this in f900a78995 ('drop ecommerce in favor of webshop'), silently
+		breaking settlement for PayFast/razorpay/paypal/etc. Restored fork
+		patch (drops the removed E Commerce Settings redirect; keeps the
+		settlement). Idempotent. framework#107.
+		"""
+		if not status:
+			return
+		if status in ("Authorized", "Completed"):
+			if self.status == "Paid":
+				return
+			self.set_as_paid()
+
 	def set_as_paid(self):
 		if self.payment_channel == "Phone":
 			self.db_set({"status": "Paid", "outstanding_amount": 0})
