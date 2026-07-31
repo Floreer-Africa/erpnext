@@ -93,7 +93,7 @@
     "max_length": 0,
     "max_value": 0,
     "read_only": 0,
-    "reqd": 0,
+    "reqd": 1,
     "show_in_filter": 0
    },
   {
