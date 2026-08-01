@@ -3,8 +3,9 @@
 {% macro item_name_and_description(d, doc) %}
 	<div class="row">
 		<div class="col-3">
-			{% if d.image %}
-				{{ product_image(d.image) }}
+			{% set display_image = item_display_image(d.item_code, d.image) %}
+			{% if display_image %}
+				{{ product_image(display_image) }}
 			{% else %}
 				<div class="website-image h-100 w-100" style="background-color:var(--gray-100);text-align: center;line-height: 3.6;">
 					{{ frappe.utils.get_abbr(d.item_name)}}
