@@ -256,15 +256,21 @@ def get_parents_for_user(parenttype: str) -> list[str]:
 
 
 def has_website_permission(doc, ptype, user, verbose=False):
+	# Floreer (framework#146): grant access if EITHER the customer or the supplier
+	# link matches. Purchase Order has both a `customer` field (drop-ship) and a
+	# `supplier` field; a contact linked to both a Customer and the Supplier is
+	# party to a supplier PO via the supplier side. Upstream returned on the
+	# customer branch first, so it checked the (empty) PO.customer and 403'd the
+	# supplier — never consulting the supplier link. Check both.
 	doctype = doc.doctype
 	customers, suppliers = get_customers_suppliers(doctype, user)
-	if customers:
-		return frappe.db.exists(doctype, get_customer_filter(doc, customers))
-	elif suppliers:
+	if customers and frappe.db.exists(doctype, get_customer_filter(doc, customers)):
+		return True
+	if suppliers:
 		fieldname = "suppliers" if doctype == "Request for Quotation" else "supplier"
-		return frappe.db.exists(doctype, {"name": doc.name, fieldname: ["in", suppliers]})
-	else:
-		return False
+		if frappe.db.exists(doctype, {"name": doc.name, fieldname: ["in", suppliers]}):
+			return True
+	return False
 
 
 def get_customer_filter(doc, customers):
