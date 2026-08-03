@@ -235,8 +235,11 @@ def get_customers_suppliers(doctype, user):
 	has_supplier_field = meta.has_field("supplier")
 
 	if has_common(["Supplier", "Customer"], frappe.get_roles(user)):
-		suppliers = get_parents_for_user("Supplier")
-		customers = get_parents_for_user("Customer")
+		# Floreer (framework#153): pass `user` through. Upstream ignored the
+		# argument and read frappe.session.user, so has_website_permission's
+		# explicit `user` was silently disregarded.
+		suppliers = get_parents_for_user("Supplier", user)
+		customers = get_parents_for_user("Customer", user)
 	elif frappe.has_permission(doctype, "read", user=user):
 		customer_list = frappe.get_list("Customer")
 		customers = suppliers = [customer.name for customer in customer_list]
@@ -244,15 +247,60 @@ def get_customers_suppliers(doctype, user):
 	return customers if has_customer_field else None, suppliers if has_supplier_field else None
 
 
-def get_parents_for_user(parenttype: str) -> list[str]:
-	portal_user = frappe.qb.DocType("Portal User")
+def get_parents_for_user(parenttype: str, user: str | None = None) -> list[str]:
+	"""Return every party of `parenttype` this portal user is a contact of.
 
-	return (
-		frappe.qb.from_(portal_user)
-		.select(portal_user.parent)
-		.where(portal_user.user == frappe.session.user)
-		.where(portal_user.parenttype == parenttype)
-	).run(pluck="name")
+	Floreer (framework#153): upstream reads ONLY the `Portal User` child table,
+	but a party is just as validly linked through `Contact.user` (or a Contact
+	Email row) plus a `Dynamic Link` — that is ERPNext's canonical portal link
+	and the only one a contact created from the desk gets. On a site where
+	suppliers were linked that way, `tabPortal User WHERE parenttype='Supplier'`
+	was empty, so every supplier's RFQ / Purchase Order / Purchase Invoice
+	portal list came back empty and has_website_permission 403'd their own
+	documents.
+
+	SECURITY: the Contact leg requires the Contact to be owned by a System
+	User. The `All` role holds create/write on Contact with `if_owner`, so any
+	Website User can insert a Contact naming themselves in `Contact.user` and
+	pointing its Dynamic Link at an arbitrary party — verified against a live
+	site. Honouring a self-created Contact here would let any portal user read
+	another party's documents. Staff-created links only. The `Portal User` leg
+	needs no such guard: it lives on the party document, which portal users
+	cannot write.
+	"""
+	user = user or frappe.session.user
+
+	portal_user = frappe.qb.DocType("Portal User")
+	parents = set(
+		(
+			frappe.qb.from_(portal_user)
+			.select(portal_user.parent)
+			.where(portal_user.user == user)
+			.where(portal_user.parenttype == parenttype)
+		).run(pluck="name")
+	)
+
+	parents.update(
+		frappe.db.sql_list(
+			"""
+			SELECT dl.link_name
+			FROM `tabContact` c
+			JOIN `tabDynamic Link` dl
+			  ON dl.parent = c.name AND dl.parenttype = 'Contact'
+			JOIN `tabUser` owner_user
+			  ON owner_user.name = c.owner AND owner_user.user_type = 'System User'
+			LEFT JOIN `tabContact Email` ce
+			  ON ce.parent = c.name
+			 AND ce.parenttype = 'Contact'
+			 AND ce.email_id = %(user)s
+			WHERE dl.link_doctype = %(parenttype)s
+			  AND (c.user = %(user)s OR ce.name IS NOT NULL)
+			""",
+			{"user": user, "parenttype": parenttype},
+		)
+	)
+
+	return sorted(parents)
 
 
 def has_website_permission(doc, ptype, user, verbose=False):
