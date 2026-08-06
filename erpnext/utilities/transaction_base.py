@@ -513,17 +513,14 @@ class TransactionBase(StatusUpdater):
 		item_obj.base_rate_with_margin = flt(item_obj.rate_with_margin) * flt(self.conversion_rate)
 		item_rate = flt(item_obj.rate_with_margin, item_obj.precision("rate"))
 
-		if item_obj.discount_percentage and not item_obj.discount_amount:
+		if item_obj.discount_percentage:
 			item_obj.discount_amount = (
 				flt(item_obj.rate_with_margin) * flt(item_obj.discount_percentage) / 100
 			)
 
-		if item_obj.discount_amount and item_obj.discount_amount > 0:
+		if item_obj.discount_amount:
 			item_rate = flt(
 				(item_obj.rate_with_margin) - (item_obj.discount_amount), item_obj.precision("rate")
-			)
-			item_obj.discount_percentage = (
-				100 * flt(item_obj.discount_amount) / flt(item_obj.rate_with_margin)
 			)
 
 		item_obj.rate = item_rate
@@ -550,7 +547,9 @@ class TransactionBase(StatusUpdater):
 		from erpnext.stock.get_item_details import apply_price_list
 
 		args = {
-			"items": [x.as_dict() for x in self.items],
+			# pass child_docname so the maintain-same-rate lock in apply_price_list can
+			# match each row, consistent with the desk (JS) callers
+			"items": [{**x.as_dict(), "child_docname": x.name} for x in self.items],
 			"customer": self.customer or self.party_name,
 			"quotation_to": self.quotation_to,
 			"customer_group": self.customer_group,
@@ -578,23 +577,20 @@ class TransactionBase(StatusUpdater):
 			"is_internal_customer": self.is_internal_customer,
 		}
 		# TODO: test method call impact on document
-		apply_price_list(cts=args, as_doc=True, doc=self)
+		apply_price_list(ctx=args, as_doc=True, doc=self)
 
 
 def delete_events(ref_type, ref_name):
+	event = frappe.qb.DocType("Event")
+	participant = frappe.qb.DocType("Event Participants")
 	events = (
-		frappe.db.sql_list(
-			""" SELECT
-			distinct `tabEvent`.name
-		from
-			`tabEvent`, `tabEvent Participants`
-		where
-			`tabEvent`.name = `tabEvent Participants`.parent
-			and `tabEvent Participants`.reference_doctype = %s
-			and `tabEvent Participants`.reference_docname = %s
-		""",
-			(ref_type, ref_name),
-		)
+		frappe.qb.from_(event)
+		.inner_join(participant)
+		.on(event.name == participant.parent)
+		.select(event.name)
+		.distinct()
+		.where((participant.reference_doctype == ref_type) & (participant.reference_docname == ref_name))
+		.run(pluck="name")
 		or []
 	)
 
