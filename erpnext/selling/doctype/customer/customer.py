@@ -313,9 +313,7 @@ class Customer(TransactionBase):
 			# permission-free "ensure" of the is-primary flag (no business logic, no
 			# validation needed). Upstream-owned — re-verify after any erpnext sync.
 			# Guarded by client_app.tests.test_customer_primary_ensure_permissionless.
-			frappe.db.set_value(
-				"Contact", self.customer_primary_contact, "is_primary_contact", 1
-			)  # ensure
+			frappe.db.set_value("Contact", self.customer_primary_contact, "is_primary_contact", 1)  # ensure
 
 	def create_primary_address(self):
 		from frappe.contacts.doctype.address.address import get_address_display
@@ -331,9 +329,7 @@ class Customer(TransactionBase):
 			# permission-free ensure of the is-primary flag, so a guest browsing (the
 			# webshop get_party() re-save) never PermissionErrors on Address and
 			# blanks the product grid. Upstream-owned — re-verify after any erpnext sync.
-			frappe.db.set_value(
-				"Address", self.customer_primary_address, "is_primary_address", 1
-			)  # ensure
+			frappe.db.set_value("Address", self.customer_primary_address, "is_primary_address", 1)  # ensure
 
 	def update_lead_status(self):
 		"""If Customer created from Lead, update lead status to "Converted"
