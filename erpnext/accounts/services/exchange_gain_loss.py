@@ -141,7 +141,7 @@ def make_exchange_gain_loss_journal(
 					.where(
 						(je.docstatus == 1)
 						& (je.name.isin(parents))
-						& (je.voucher_type == "Exchange Gain or Loss")
+						& (je.voucher_type == "Exchange Gain Or Loss")
 					)
 					.run()
 				)
@@ -195,7 +195,7 @@ def make_exchange_gain_loss_journal(
 
 def is_payable_account(reference_doctype: str, account: str) -> bool:
 	if reference_doctype == "Purchase Invoice" or (
-		reference_doctype == "Journal Entry"
+		reference_doctype in ("Journal Entry", "Payment Entry")
 		and frappe.get_cached_value("Account", account, "account_type") == "Payable"
 	):
 		return True

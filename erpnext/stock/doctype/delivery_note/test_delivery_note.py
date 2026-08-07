@@ -50,7 +50,7 @@ class TestDeliveryNote(ERPNextTestSuite):
 		self.load_test_records("Stock Entry")
 
 	def get_perpetual_defaults(self):
-		company = frappe.get_doc("Company", "_Test Company with perpetual inventory")
+		company = frappe.get_doc("Company", "_Test SDBNB Company")
 		self.perpetual_company = company.name
 		self.perpetual_account = company.stock_delivered_but_not_billed
 		self.perpetual_cost_center = company.cost_center
@@ -723,6 +723,76 @@ class TestDeliveryNote(ERPNextTestSuite):
 
 		self.assertEqual(gle_warehouse_amount, 1400)
 
+	def test_return_bundle_voucher_detail_no_as_packed_item(self):
+		"""Return bundle whose voucher_detail_no is the Packed Item (SLE-driven path) must still value on repost."""
+		from erpnext.stock.doctype.delivery_note.mapper import make_sales_return
+
+		warehouse = "_Test Warehouse - _TC"
+		packed_item = make_item(
+			properties={
+				"is_stock_item": 1,
+				"has_batch_no": 1,
+				"create_new_batch": 1,
+				"batch_number_series": "BATCH-DN-RET-VDN-.#####",
+			}
+		).name
+		bundle_item = make_item(properties={"is_stock_item": 0, "is_sales_item": 1}).name
+		make_product_bundle(bundle_item, [packed_item], qty=20)
+
+		make_stock_entry(item_code=packed_item, target=warehouse, qty=60, basic_rate=35)
+
+		dn = create_delivery_note(item_code=bundle_item, warehouse=warehouse, qty=3)
+
+		return_dn = make_sales_return(dn.name)
+		return_dn.items[0].qty = -2
+		return_dn.submit()
+		return_dn.reload()
+
+		packed_row = return_dn.packed_items[0]
+		bundle = frappe.get_doc("Serial and Batch Bundle", packed_row.serial_and_batch_bundle)
+
+		# Reproduce the reported state: bundle points at the Packed Item (not the DN Item), valuation at 0.
+		bundle.db_set("voucher_detail_no", packed_row.name)
+		bundle.db_set({"avg_rate": 0, "total_amount": 0})
+		for entry in bundle.entries:
+			entry.db_set({"incoming_rate": 0, "stock_value_difference": 0})
+		packed_row.db_set("incoming_rate", 0)
+		frappe.db.set_value(
+			"Stock Ledger Entry",
+			{
+				"voucher_type": "Delivery Note",
+				"voucher_no": return_dn.name,
+				"item_code": packed_item,
+				"is_cancelled": 0,
+			},
+			{"incoming_rate": 0, "stock_value_difference": 0},
+		)
+
+		frappe.get_doc(
+			doctype="Repost Item Valuation",
+			based_on="Transaction",
+			voucher_type="Delivery Note",
+			voucher_no=return_dn.name,
+			posting_date=return_dn.posting_date,
+			posting_time=return_dn.posting_time,
+		).submit()
+
+		bundle.reload()
+		self.assertEqual(flt(bundle.avg_rate), 35)
+
+		incoming_rate, stock_value_difference = frappe.db.get_value(
+			"Stock Ledger Entry",
+			{
+				"voucher_type": "Delivery Note",
+				"voucher_no": return_dn.name,
+				"item_code": packed_item,
+				"is_cancelled": 0,
+			},
+			["incoming_rate", "stock_value_difference"],
+		)
+		self.assertEqual(flt(incoming_rate), 35)
+		self.assertEqual(flt(stock_value_difference), 1400)
+
 	def test_bin_details_of_packed_item(self):
 		from erpnext.selling.doctype.product_bundle.test_product_bundle import make_product_bundle
 		from erpnext.stock.doctype.item.test_item import make_item
@@ -924,12 +994,15 @@ class TestDeliveryNote(ERPNextTestSuite):
 		self.assertTrue(gl_entries)
 
 		stock_value_difference = abs(
-			frappe.db.sql(
-				"""select sum(stock_value_difference)
-			from `tabStock Ledger Entry` where voucher_type='Delivery Note' and voucher_no=%s
-			and warehouse='Stores - TCP1'""",
-				dn.name,
-			)[0][0]
+			frappe.get_all(
+				"Stock Ledger Entry",
+				filters={
+					"voucher_type": "Delivery Note",
+					"voucher_no": dn.name,
+					"warehouse": "Stores - TCP1",
+				},
+				fields=[{"SUM": "stock_value_difference", "as": "svd"}],
+			)[0].svd
 		)
 
 		expected_values = {
@@ -955,7 +1028,7 @@ class TestDeliveryNote(ERPNextTestSuite):
 		dn.submit()
 
 		update_delivery_note_status(dn.name, "Closed")
-		self.assertEqual(frappe.db.get_value("Delivery Note", dn.name, "Status"), "Closed")
+		self.assertEqual(frappe.db.get_value("Delivery Note", dn.name, "status"), "Closed")
 
 		# Check cancelling closed delivery note
 		dn.load_from_db()
@@ -2637,6 +2710,92 @@ class TestDeliveryNote(ERPNextTestSuite):
 		self.assertEqual(dn.per_returned, 100)
 		self.assertEqual(returned.status, "Return")
 
+	def _assert_credit_note_from_return_dn_resets_per_billed(self, so, dn):
+		"""Given a fully billed Sales Order and a submitted Delivery Note that delivers it,
+		a credit note made from the return of that Delivery Note must reset per_billed to 0
+		while leaving the delivery quantities exactly as the return already set them."""
+		from erpnext.stock.doctype.delivery_note.mapper import make_sales_return
+
+		so.load_from_db()
+		self.assertEqual(so.per_delivered, 100)
+		self.assertEqual(so.per_billed, 100)
+
+		return_dn = make_sales_return(dn.name)
+		return_dn.insert()
+		return_dn.submit()
+
+		# the return reverses the delivery quantities
+		so.load_from_db()
+		self.assertEqual(so.per_delivered, 0)
+		self.assertEqual(so.items[0].delivered_qty, 0)
+
+		credit_note = make_sales_invoice(return_dn.name)
+		self.assertTrue(credit_note.is_return)
+		self.assertTrue(credit_note.update_billed_amount_in_sales_order)
+		# A Delivery Note-linked invoice can't update stock (validate_delivery_note), so the
+		# credit note only rolls back billing and never re-reverses the delivery quantities.
+		self.assertFalse(credit_note.update_stock)
+		credit_note.insert()
+		credit_note.submit()
+
+		# per_billed is reset, and the delivery state stays exactly as the return left it
+		so.load_from_db()
+		self.assertEqual(so.per_billed, 0)
+		self.assertEqual(so.per_delivered, 0)
+		self.assertEqual(so.items[0].delivered_qty, 0)
+		self.assertEqual(so.items[0].returned_qty, 0)
+
+		# Cancelling the credit note should restore the billed amount on the Sales Order.
+		credit_note.cancel()
+		so.load_from_db()
+		self.assertEqual(so.per_billed, 100)
+
+	def test_sales_order_per_billed_after_credit_note_from_return_dn(self):
+		# Reported flow: SO -> SI (from SO) -> DN (from SI) -> return DN -> credit note.
+		# The DN carries si_detail in this path.
+		from erpnext.accounts.doctype.sales_invoice.mapper import make_delivery_note
+		from erpnext.selling.doctype.sales_order.mapper import make_sales_invoice as make_si_from_so
+
+		make_stock_entry(item_code="_Test Item", target="_Test Warehouse - _TC", qty=10, basic_rate=100)
+
+		so = make_sales_order(qty=2)
+
+		si = make_si_from_so(so.name)
+		si.insert()
+		si.submit()
+
+		dn = make_delivery_note(si.name)
+		dn.insert()
+		dn.submit()
+
+		self._assert_credit_note_from_return_dn_resets_per_billed(so, dn)
+
+	def test_sales_order_per_billed_after_credit_note_from_so_derived_dn(self):
+		# SO billed and delivered separately (SO -> SI, SO -> DN), then return DN -> credit note.
+		# SO per_billed rolls back via the status_updater in update_prevdoc_status.
+		from erpnext.selling.doctype.sales_order.mapper import (
+			make_delivery_note as make_dn_from_so,
+		)
+		from erpnext.selling.doctype.sales_order.mapper import (
+			make_sales_invoice as make_si_from_so,
+		)
+
+		make_stock_entry(item_code="_Test Item", target="_Test Warehouse - _TC", qty=10, basic_rate=100)
+
+		so = make_sales_order(qty=2)
+
+		si = make_si_from_so(so.name)
+		si.insert()
+		si.submit()
+
+		dn = make_dn_from_so(so.name)
+		dn.insert()
+		dn.submit()
+
+		self.assertIsNone(dn.items[0].si_detail)
+
+		self._assert_credit_note_from_return_dn_resets_per_billed(so, dn)
+
 	def test_packed_item_serial_no_status(self):
 		from erpnext.selling.doctype.product_bundle.test_product_bundle import make_product_bundle
 		from erpnext.stock.doctype.item.test_item import make_item
@@ -3375,6 +3534,68 @@ class TestDeliveryNote(ERPNextTestSuite):
 		dn.items[0].incoming_rate = 0
 		dn.items[0].stock_qty = 2
 		dn.save()
+
+	def test_validate_proj_cust_matches_project_customer(self):
+		"""validate_proj_cust must reject a DN whose customer differs from the project's customer,
+		and accept one when the project has no customer (the ifnull(customer,'')='' / `is not set`
+		branch of the converted or_filters)."""
+		mismatch_project = frappe.get_doc(
+			{
+				"doctype": "Project",
+				"project_name": "_Test DN Project Mismatch",
+				"company": "_Test Company",
+				"customer": "_Test Customer 1",
+			}
+		).insert()
+		dn = create_delivery_note(customer="_Test Customer", do_not_save=True)
+		dn.project = mismatch_project.name
+		with self.assertRaises(frappe.ValidationError) as cm:
+			dn.insert()
+		self.assertIn("does not belong to project", str(cm.exception))
+
+		# A project with no customer must pass via the empty-string/NULL or_filters branch.
+		open_project = frappe.get_doc(
+			{
+				"doctype": "Project",
+				"project_name": "_Test DN Project No Customer",
+				"company": "_Test Company",
+			}
+		).insert()
+		self.assertFalse(open_project.customer)
+		dn2 = create_delivery_note(customer="_Test Customer", do_not_save=True)
+		dn2.project = open_project.name
+		dn2.insert()  # must not raise
+		self.assertTrue(dn2.name)
+
+	def test_check_next_docstatus_blocks_cancel_with_submitted_invoice(self):
+		"""check_next_docstatus must block cancelling a DN once a submitted Sales Invoice draws from
+		it — covers the converted child-table get_all (Sales Invoice Item, docstatus=1)."""
+		dn = create_delivery_note()  # submitted, simple _Test Item
+		si = make_sales_invoice(dn.name)
+		si.insert()
+		si.submit()
+
+		dn.load_from_db()
+		with self.assertRaises(frappe.ValidationError) as cm:
+			dn.cancel()
+		self.assertIn("has already been submitted", str(cm.exception))
+
+	def test_cancel_packing_slips_cancels_submitted_slips(self):
+		"""cancel_packing_slips must cancel the DN's submitted Packing Slips — covers the converted
+		get_all(pluck=name) lookup and the pluck-aware iteration."""
+		from erpnext.stock.doctype.delivery_note.mapper import make_packing_slip
+		from erpnext.stock.doctype.delivery_note.services.packing import PackingService
+
+		dn = create_delivery_note(do_not_submit=True)  # draft, so a Packing Slip can be mapped
+		ps = make_packing_slip(dn.name)
+		ps.save()
+		ps.submit()
+		dn.submit()
+		self.assertEqual(frappe.db.get_value("Packing Slip", ps.name, "docstatus"), 1)
+
+		PackingService(dn).cancel_packing_slips()
+
+		self.assertEqual(frappe.db.get_value("Packing Slip", ps.name, "docstatus"), 2)
 
 
 def create_delivery_note(**args):

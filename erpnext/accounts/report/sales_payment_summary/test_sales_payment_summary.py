@@ -2,12 +2,13 @@
 # License: GNU General Public License v3. See license.txt
 
 import frappe
-from frappe.utils import today
+from frappe.utils import flt, today
 
 from erpnext.accounts.doctype.payment_entry.payment_entry import get_payment_entry
 from erpnext.accounts.report.sales_payment_summary.sales_payment_summary import (
 	get_mode_of_payment_details,
 	get_mode_of_payments,
+	get_pos_invoice_data,
 )
 from erpnext.tests.utils import ERPNextTestSuite
 
@@ -52,6 +53,53 @@ class TestSalesPaymentSummary(ERPNextTestSuite):
 		mop = get_mode_of_payments(filters)
 		self.assertIn("Credit Card", next(iter(mop.values())))
 		self.assertNotIn("Cash", next(iter(mop.values())))
+
+	def test_pos_invoice_warehouse_and_cost_center_come_from_one_item(self):
+		"""The reported warehouse and cost centre must belong to the same item line.
+
+		They describe a line, not the invoice, and an invoice can carry several. Aggregating each
+		on its own can report a warehouse from one line beside a cost centre from another -- a pair
+		that was never posted. The warehouse is also an outer grouping key, so the pick decides how
+		rows are partitioned and what each one totals, not just what is displayed.
+		"""
+		from erpnext.stock.doctype.item.test_item import make_item
+		from erpnext.stock.doctype.warehouse.test_warehouse import create_warehouse
+
+		low_warehouse = create_warehouse("_Test POS Summary AAA")
+		high_warehouse = create_warehouse("_Test POS Summary ZZZ")
+		second_item = make_item("_Test POS Summary Second Item", {"is_stock_item": 0}).name
+
+		si = create_sales_invoice_record()
+		si.is_pos = 1
+		# cross the two picks: the higher warehouse is on the line with the lower cost centre, so an
+		# independently aggregated pair cannot belong to either line
+		si.items[0].warehouse = high_warehouse
+		si.items[0].cost_center = "Main - _TC"
+		si.append(
+			"items",
+			{
+				"item_code": second_item,
+				"qty": 1,
+				"rate": 5000,
+				"income_account": "Sales - _TC",
+				"expense_account": "Cost of Goods Sold - _TC",
+				"warehouse": low_warehouse,
+				"cost_center": "Sub - _TC",
+			},
+		)
+		si.append("payments", {"mode_of_payment": "Cash", "account": "_Test Cash - _TC", "amount": 15000})
+		si.insert()
+		si.submit()
+
+		posted = {(row.warehouse, row.cost_center) for row in si.items}
+		self.assertGreater(len(posted), 1, "fixture must post more than one distinct pair")
+
+		rows = get_pos_invoice_data(get_filters())
+		reported = [r for r in rows if r.get("warehouse") in {w for w, _ in posted}]
+		self.assertTrue(reported)
+
+		for row in reported:
+			self.assertIn((row["warehouse"], row["cost_center"]), posted)
 
 	def test_get_mode_of_payments_details(self):
 		filters = get_filters()
@@ -101,6 +149,33 @@ class TestSalesPaymentSummary(ERPNextTestSuite):
 				cc_final_amount = mopd_value[1]
 
 		self.assertGreater(cc_init_amount, cc_final_amount)
+
+	def test_get_pos_invoice_data(self):
+		"""The POS path (is_pos filter -> get_pos_invoice_data) used nested loose-GROUP-BY subqueries
+		that raised on Postgres; it now aggregates deterministically and runs identically on both
+		engines."""
+		si = create_sales_invoice_record()
+		si.is_pos = 1
+		si.append(
+			"payments",
+			{"mode_of_payment": "Cash", "account": "_Test Cash - _TC", "amount": 10000},
+		)
+		si.insert()
+		si.submit()
+
+		filters = frappe._dict(
+			{"is_pos": 1, "company": "_Test Company", "from_date": today(), "to_date": today()}
+		)
+		data = get_pos_invoice_data(filters)
+
+		# the POS invoice's paid amount is aggregated; previously this query raised GroupingError on PG
+		self.assertTrue(data)
+		self.assertTrue(any(flt(row.get("paid_amount")) >= 10000 for row in data))
+
+		# customer filter must work: a.customer was not selected by the invoice subquery before the fix,
+		# so the filter errored on both engines. With the invoice's customer it still returns its payment.
+		filters["customer"] = si.customer
+		self.assertTrue(any(flt(row.get("paid_amount")) >= 10000 for row in get_pos_invoice_data(filters)))
 
 
 def get_filters():

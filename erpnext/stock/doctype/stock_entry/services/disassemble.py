@@ -2,7 +2,7 @@ from collections import defaultdict
 
 import frappe
 from frappe import _
-from frappe.query_builder.functions import Sum
+from frappe.query_builder.functions import Min, NullIf, Sum
 from frappe.utils import flt
 
 from erpnext.stock.doctype.serial_no.serial_no import get_serial_nos
@@ -348,14 +348,78 @@ class DisassembleStockEntry(BaseStockEntry):
 				.run(as_dict=True)
 			)
 
-		return (
-			query.select(Sum(SED.qty).as_("qty"), Sum(SED.transfer_qty).as_("transfer_qty"), *common_fields)
+		# Aggregate in stock UOM: qty is expressed in each row's selected UOM and cannot be added
+		# when manufacture entries use different UOMs for the same item. basic_rate is also per
+		# stock UOM, so weight it by transfer_qty. Manufacture rows always carry positive stock
+		# qty, so NullIf only guards a theoretical /0.
+		rows = (
+			query.select(
+				SED.item_code,
+				Sum(SED.transfer_qty).as_("qty"),
+				Sum(SED.transfer_qty).as_("transfer_qty"),
+				(Sum(SED.basic_rate * SED.transfer_qty) / NullIf(Sum(SED.transfer_qty), 0)).as_("basic_rate"),
+			)
 			.where(SE.purpose == "Manufacture")
 			.where(SE.work_order == self.doc.work_order)
 			.groupby(SED.item_code)
+			.orderby(Min(SED.idx))
+			.run(as_dict=True)
+		)
+
+		representative = self.get_representative_manufacture_rows()
+		for row in rows:
+			row.update(representative.get(row.item_code) or {})
+			row.uom = row.stock_uom
+			row.conversion_factor = 1
+
+		return rows
+
+	def get_representative_manufacture_rows(self):
+		"""Earliest posted line per item across the work order's Manufacture entries.
+
+		The disassembly wants one row per item, but some descriptive columns describe a line, not
+		an item: batch_no and serial_no only mean something beside their warehouse, and
+		is_finished_item decides whether the row is the output or an input. Aggregating each column
+		on its own can pair values from different lines into a row that was never posted, so take
+		the columns from a single real line instead. UOM is normalized separately to stock UOM.
+		"""
+		SE = frappe.qb.DocType("Stock Entry")
+		SED = frappe.qb.DocType("Stock Entry Detail")
+
+		lines = (
+			frappe.qb.from_(SED)
+			.join(SE)
+			.on(SED.parent == SE.name)
+			.select(
+				SED.item_code,
+				SED.item_name,
+				SED.description,
+				SED.stock_uom,
+				SED.is_finished_item,
+				SED.secondary_item_type,
+				SED.is_legacy_scrap_item,
+				SED.bom_secondary_item,
+				SED.batch_no,
+				SED.serial_no,
+				SED.use_serial_batch_fields,
+				SED.s_warehouse,
+				SED.t_warehouse,
+				SED.bom_no,
+			)
+			.where(
+				(SE.docstatus == 1) & (SE.purpose == "Manufacture") & (SE.work_order == self.doc.work_order)
+			)
+			.orderby(SE.creation)
+			.orderby(SE.name)
 			.orderby(SED.idx)
 			.run(as_dict=True)
 		)
+
+		representative = {}
+		for line in lines:
+			representative.setdefault(line.item_code, line)
+
+		return representative
 
 	def on_submit(self):
 		self.set_serial_batch_for_disassembly()
