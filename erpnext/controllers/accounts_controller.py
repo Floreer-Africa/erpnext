@@ -211,6 +211,52 @@ class AccountsController(TransactionBase):
 				frappe.msgprint(msg)
 
 	def validate(self):
+		# Floreer vendored-fork patch (framework#165). ERPNext is adding hard
+		# permission checks INSIDE this validate chain — 8a940af7e1 (#56745)
+		# get_party_account -> account_perm_check, 5835709402 (#57515)
+		# get_item_details -> item.check_permission(), and more landing each
+		# release (#57201, payment_request, item_variant, asset_capitalization).
+		# They test frappe.has_permission against **frappe.session.user** and
+		# honour neither ignore_permissions nor the global flag; only
+		# Administrator short-circuits.
+		#
+		# A webshop shopper is a Website User with no Item/Account permission, so
+		# on the upgraded stack EVERY cart write fails — update_cart's
+		# quotation.save() and place_order's submit alike — with PermissionError
+		# -> HTTP 403 -> /login. Same family as framework#113 / #121 / #127
+		# (bug-1429 took ordering down in production for exactly this reason).
+		#
+		# Elevate only when the CALLER has already declared the write trusted
+		# (flags.ignore_permissions — webshop cart.py sets it on every cart
+		# save/submit). One patch at the single point both hardened calls run
+		# under, rather than chasing each new check upstream adds.
+		#
+		# Scoped to validate ON PURPOSE: run_before_save_methods() completes
+		# before db_insert() assigns `owner = frappe.session.user`, so the
+		# customer still owns their Quotation/Sales Order and the order stays
+		# visible in the if_owner-scoped portal "My Orders". Wrapping the whole
+		# save/submit instead would silently reassign ownership to Administrator.
+		#
+		# NOT solved by granting the Customer role Item read: verified
+		# empirically that this exposes valuation_rate and last_purchase_rate
+		# via /api/resource/Item to all portal users.
+		if self.flags.ignore_permissions and frappe.session.user != "Administrator":
+			_prev_user = frappe.session.user
+			_prev_sid = frappe.session.sid
+			_prev_data = frappe.session.data
+			try:
+				frappe.set_user("Administrator")
+				return self._floreer_validate_body()
+			finally:
+				# set_user() clobbers sid and WIPES session.data — restoring the
+				# user alone logs a live web customer out on the next request
+				# (floreer_app#167).
+				frappe.set_user(_prev_user)
+				frappe.session.sid = _prev_sid
+				frappe.session.data = _prev_data
+		return self._floreer_validate_body()
+
+	def _floreer_validate_body(self):
 		if not self.get("is_return") and not self.get("is_debit_note"):
 			self.validate_qty_is_not_zero()
 
