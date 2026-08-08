@@ -450,7 +450,17 @@ class SalesInvoice(SellingController):
 
 			self.validate_standalone_serial_nos_customer()
 			self.update_stock_reservation_entries()
-			self.update_stock_ledger()
+			# PR-Foundry fork patch (framework#124, pos#361): pass the flag through.
+			# Every layer below already accepts `allow_negative_stock`
+			# (make_sl_entries -> repost_current_voucher -> update_entries_after);
+			# Sales Invoice was the only break in the chain, calling with no argument
+			# so it always defaulted False. Without this a voucher has no supported
+			# way to post at negative stock deliberately, which drove pos to mutate
+			# the CACHED Stock Settings doc instead — a bypass that silently vanishes
+			# when the cache memo is dropped. Defaults False, so nothing else changes.
+			self.update_stock_ledger(
+				allow_negative_stock=bool(self.flags.get("allow_negative_stock"))
+			)
 
 		FixedAssetService(self).split_asset_based_on_sale_qty()
 		FixedAssetService(self).process_asset_depreciation()
@@ -532,7 +542,17 @@ class SalesInvoice(SellingController):
 
 		SalesTaxWithholding(self).on_cancel()
 		if self.update_stock == 1:
-			self.update_stock_ledger()
+			# PR-Foundry fork patch (framework#124, pos#361): pass the flag through.
+			# Every layer below already accepts `allow_negative_stock`
+			# (make_sl_entries -> repost_current_voucher -> update_entries_after);
+			# Sales Invoice was the only break in the chain, calling with no argument
+			# so it always defaulted False. Without this a voucher has no supported
+			# way to post at negative stock deliberately, which drove pos to mutate
+			# the CACHED Stock Settings doc instead — a bypass that silently vanishes
+			# when the cache memo is dropped. Defaults False, so nothing else changes.
+			self.update_stock_ledger(
+				allow_negative_stock=bool(self.flags.get("allow_negative_stock"))
+			)
 
 		FixedAssetService(self).process_asset_depreciation()
 
