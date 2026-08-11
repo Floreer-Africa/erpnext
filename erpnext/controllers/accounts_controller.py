@@ -4,6 +4,7 @@
 
 import json
 from collections import defaultdict
+from contextlib import contextmanager
 
 import frappe
 from frappe import _, bold, qb, throw
@@ -72,6 +73,57 @@ force_item_fields = (
 	"total_weight",
 	"valuation_rate",
 )
+
+
+def floreer_trusted_but_unprivileged(doc) -> bool:
+	"""True when the CALLER declared this write trusted but the session cannot
+	pass the permission checks upstream now performs inside this controller.
+
+	Floreer vendored-fork patch (framework#165, framework#175). ERPNext is running
+	a sustained campaign of adding hard permission checks deep inside the
+	transaction-controller call chain — 8a940af7e1 (#56745) get_party_account ->
+	account_perm_check, 5835709402 (#57515) get_item_details ->
+	item.check_permission(), plus #57201 / payment_request / item_variant /
+	asset_capitalization. They test ``frappe.has_permission`` against
+	**``frappe.session.user``** and honour neither ``ignore_permissions`` nor the
+	global flag; only ``Administrator`` short-circuits.
+
+	A webshop shopper is a Website User with no Item/Account permission, so those
+	checks fire in the shopper's own session and take the storefront down.
+	``flags.ignore_permissions`` is the trust signal: webshop's cart sets it on
+	every cart recalculation, save and submit.
+
+	Deliberately NOT solved by granting the ``Customer`` role Item read: verified
+	empirically that this exposes ``valuation_rate`` / ``last_purchase_rate`` via
+	``/api/resource/Item`` to every portal user.
+	"""
+	return bool(doc.flags.ignore_permissions) and frappe.session.user != "Administrator"
+
+
+@contextmanager
+def floreer_system_authority():
+	"""Run a block with system authority, then restore the caller's session.
+
+	``set_user()`` clobbers ``sid`` and WIPES ``session.data`` — restoring the
+	user alone logs a live web customer out on their next request
+	(floreer_app#167), so all three are saved and put back.
+
+	Kept as narrow as possible on purpose: ``run_before_save_methods()`` completes
+	before ``db_insert()`` assigns ``owner = frappe.session.user``, so the customer
+	still owns their Quotation / Sales Order and the order stays visible in the
+	``if_owner``-scoped portal "My Orders". Wrapping a whole save/submit instead
+	silently reassigns ownership to Administrator (measured).
+	"""
+	prev_user = frappe.session.user
+	prev_sid = frappe.session.sid
+	prev_data = frappe.session.data
+	try:
+		frappe.set_user("Administrator")
+		yield
+	finally:
+		frappe.set_user(prev_user)
+		frappe.session.sid = prev_sid
+		frappe.session.data = prev_data
 
 
 class AccountsController(TransactionBase):
@@ -211,49 +263,20 @@ class AccountsController(TransactionBase):
 				frappe.msgprint(msg)
 
 	def validate(self):
-		# Floreer vendored-fork patch (framework#165). ERPNext is adding hard
-		# permission checks INSIDE this validate chain — 8a940af7e1 (#56745)
-		# get_party_account -> account_perm_check, 5835709402 (#57515)
-		# get_item_details -> item.check_permission(), and more landing each
-		# release (#57201, payment_request, item_variant, asset_capitalization).
-		# They test frappe.has_permission against **frappe.session.user** and
-		# honour neither ignore_permissions nor the global flag; only
-		# Administrator short-circuits.
+		# Floreer vendored-fork patch (framework#165). ERPNext keeps adding hard
+		# permission checks INSIDE this validate chain — see
+		# floreer_trusted_but_unprivileged() for the full rationale. A webshop
+		# shopper is a Website User with no Item/Account permission, so on the
+		# upgraded stack EVERY cart write failed — update_cart's quotation.save()
+		# and place_order's submit alike — with PermissionError -> HTTP 403 ->
+		# /login. Same family as framework#113 / #121 / #127 (bug-1429 took
+		# ordering down in production for exactly this reason).
 		#
-		# A webshop shopper is a Website User with no Item/Account permission, so
-		# on the upgraded stack EVERY cart write fails — update_cart's
-		# quotation.save() and place_order's submit alike — with PermissionError
-		# -> HTTP 403 -> /login. Same family as framework#113 / #121 / #127
-		# (bug-1429 took ordering down in production for exactly this reason).
-		#
-		# Elevate only when the CALLER has already declared the write trusted
-		# (flags.ignore_permissions — webshop cart.py sets it on every cart
-		# save/submit). One patch at the single point both hardened calls run
+		# One patch at the single point every hardened call in validate runs
 		# under, rather than chasing each new check upstream adds.
-		#
-		# Scoped to validate ON PURPOSE: run_before_save_methods() completes
-		# before db_insert() assigns `owner = frappe.session.user`, so the
-		# customer still owns their Quotation/Sales Order and the order stays
-		# visible in the if_owner-scoped portal "My Orders". Wrapping the whole
-		# save/submit instead would silently reassign ownership to Administrator.
-		#
-		# NOT solved by granting the Customer role Item read: verified
-		# empirically that this exposes valuation_rate and last_purchase_rate
-		# via /api/resource/Item to all portal users.
-		if self.flags.ignore_permissions and frappe.session.user != "Administrator":
-			_prev_user = frappe.session.user
-			_prev_sid = frappe.session.sid
-			_prev_data = frappe.session.data
-			try:
-				frappe.set_user("Administrator")
+		if floreer_trusted_but_unprivileged(self):
+			with floreer_system_authority():
 				return self._floreer_validate_body()
-			finally:
-				# set_user() clobbers sid and WIPES session.data — restoring the
-				# user alone logs a live web customer out on the next request
-				# (floreer_app#167).
-				frappe.set_user(_prev_user)
-				frappe.session.sid = _prev_sid
-				frappe.session.data = _prev_data
 		return self._floreer_validate_body()
 
 	def _floreer_validate_body(self):
@@ -732,6 +755,26 @@ class AccountsController(TransactionBase):
 				)
 
 	def set_missing_item_details(self, for_validate=False):
+		"""set missing item values"""
+		# Floreer vendored-fork patch (framework#175). The framework#165 patch on
+		# validate() is NOT enough: webshop's cart reaches get_item_details
+		# without ever entering validate — apply_cart_settings calls
+		# `quotation.run_method("set_price_list_and_item_details")` directly
+		# (cart.py:503) -> set_price_list_and_item_details (selling_controller)
+		# -> here -> get_item_details -> item.check_permission().
+		#
+		# Production ran WITH framework#165 and still lost every cart write for
+		# all 352 portal customers, because this route bypasses it entirely. A
+		# clean PermissionError writes no Error Log row, so the outage was
+		# invisible server-side for ~19 hours.
+		#
+		# Guarded by floreer_app.tests.test_cart_item_permissions.
+		if floreer_trusted_but_unprivileged(self):
+			with floreer_system_authority():
+				return self._floreer_set_missing_item_details_body(for_validate=for_validate)
+		return self._floreer_set_missing_item_details_body(for_validate=for_validate)
+
+	def _floreer_set_missing_item_details_body(self, for_validate=False):
 		"""set missing item values"""
 		from erpnext.stock.doctype.serial_no.serial_no import get_serial_nos
 
