@@ -516,6 +516,29 @@ class PaymentRequest(Document):
 			return
 		if status in ("Authorized", "Completed"):
 			if self.status == "Paid":
+				# Idempotent, but NOT silent (framework#148). Every gateway
+				# calls this only after a successful charge, and a re-notified
+				# SAME charge is stopped upstream (payfast: the Integration
+				# Request guard; stripe: synchronous, one request per attempt),
+				# so arriving here with the request already paid means real
+				# money moved twice. Returning without a word is how a genuine
+				# double charge left no trace anywhere and surfaced only on a
+				# gateway reconciliation. Prevention is at the pay link, before
+				# the money moves (PR-Foundry/pr-reporter#41); this is the one
+				# place that detects it for every gateway at once.
+				frappe.log_error(
+					title="Payment Request already paid: second settlement ignored",
+					message=(
+						f"{self.name} is already Paid; a further '{status}' settlement "
+						f"arrived for {self.reference_doctype} {self.reference_name} "
+						f"(amount {self.grand_total}). No second Payment Entry was created. "
+						"The earlier charge is already booked, so this one is very likely a "
+						"DUPLICATE PAYMENT sitting at the gateway - reconcile it and refund "
+						"if confirmed."
+					),
+					reference_doctype="Payment Request",
+					reference_name=self.name,
+				)
 				return
 			self.set_as_paid()
 
