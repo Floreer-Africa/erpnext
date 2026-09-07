@@ -28,7 +28,9 @@ from erpnext.stock.doctype.serial_and_batch_bundle.test_serial_and_batch_bundle 
 )
 from erpnext.stock.doctype.serial_no.serial_no import *
 from erpnext.stock.doctype.stock_entry.stock_entry import (
+	DuplicateEntryForWorkOrderError,
 	FinishedGoodError,
+	ManufacturedQtyMandatoryError,
 	get_pending_work_orders,
 	make_stock_in_entry,
 )
@@ -58,6 +60,71 @@ class TestStockEntry(ERPNextTestSuite):
 	def setUp(self):
 		self.load_test_records("Stock Entry")
 		frappe.local.flags.dont_execute_stock_reposts = False
+
+	def test_subcontracting_inward_warehouse_direction(self):
+		source_warehouse = "_Test Warehouse - _TC"
+		target_warehouse = "_Test Warehouse 1 - _TC"
+
+		for purpose in ("Return Raw Material to Customer", "Subcontracting Delivery"):
+			with self.subTest(purpose=purpose):
+				stock_entry = frappe.new_doc("Stock Entry")
+				stock_entry.purpose = purpose
+				stock_entry.from_warehouse = source_warehouse
+				stock_entry.to_warehouse = target_warehouse
+				stock_entry.append(
+					"items",
+					{
+						"item_code": "_Test Item",
+						"t_warehouse": target_warehouse,
+						"cost_center": "Main - _TC",
+					},
+				)
+
+				stock_entry.before_validate()
+
+				self.assertEqual(stock_entry.from_warehouse, source_warehouse)
+				self.assertIsNone(stock_entry.to_warehouse)
+				self.assertEqual(stock_entry.items[0].s_warehouse, source_warehouse)
+				self.assertIsNone(stock_entry.items[0].t_warehouse)
+
+		for purpose in ("Receive from Customer", "Subcontracting Return"):
+			with self.subTest(purpose=purpose):
+				stock_entry = frappe.new_doc("Stock Entry")
+				stock_entry.purpose = purpose
+				stock_entry.from_warehouse = source_warehouse
+				stock_entry.to_warehouse = target_warehouse
+				stock_entry.append(
+					"items",
+					{
+						"item_code": "_Test Item",
+						"s_warehouse": source_warehouse,
+						"cost_center": "Main - _TC",
+					},
+				)
+
+				stock_entry.before_validate()
+
+				self.assertIsNone(stock_entry.from_warehouse)
+				self.assertEqual(stock_entry.to_warehouse, target_warehouse)
+				self.assertIsNone(stock_entry.items[0].s_warehouse)
+				self.assertEqual(stock_entry.items[0].t_warehouse, target_warehouse)
+
+	def test_subcontracting_inward_warehouse_is_mandatory(self):
+		purposes = {
+			"Return Raw Material to Customer": "Source Warehouse is required",
+			"Subcontracting Delivery": "Source Warehouse is required",
+			"Receive from Customer": "Target Warehouse is required",
+			"Subcontracting Return": "Target Warehouse is required",
+		}
+
+		for purpose, message in purposes.items():
+			with self.subTest(purpose=purpose):
+				stock_entry = frappe.new_doc("Stock Entry")
+				stock_entry.purpose = purpose
+				stock_entry.append("items", {"item_code": "_Test Item"})
+
+				with self.assertRaisesRegex(frappe.ValidationError, message):
+					stock_entry.validate()
 
 	def test_stock_entry_qty(self):
 		item_code = "_Test Item 2"
@@ -446,6 +513,159 @@ class TestStockEntry(ERPNextTestSuite):
 		self.assertFalse(
 			frappe.db.exists("GL Entry", {"voucher_type": "Stock Entry", "voucher_no": repack.name})
 		)
+
+	def test_batch_split_stock_entry_type(self):
+		original_value = frappe.db.get_single_value(
+			"Stock Settings", "auto_create_serial_and_batch_bundle_for_outward"
+		)
+		frappe.db.set_single_value("Stock Settings", "auto_create_serial_and_batch_bundle_for_outward", 1)
+		self.addCleanup(
+			frappe.db.set_single_value,
+			"Stock Settings",
+			"auto_create_serial_and_batch_bundle_for_outward",
+			original_value,
+		)
+
+		if not frappe.db.exists("Stock Entry Type", "Batch Split"):
+			frappe.new_doc("Stock Entry Type", purpose="Repack", batch_split=1).insert(
+				set_name="Batch Split", ignore_permissions=True
+			)
+
+		warehouse = "_Test Warehouse - _TC"
+		rm = make_item(
+			"Batch Split Repack RM",
+			{
+				"is_stock_item": 1,
+				"has_batch_no": 1,
+				"create_new_batch": 1,
+				"batch_number_series": "BS-RP-RM-.####",
+			},
+		).name
+		fg = make_item(
+			"Batch Split Repack FG",
+			{
+				"is_stock_item": 1,
+				"has_batch_no": 1,
+				"create_new_batch": 1,
+				"batch_number_series": "BS-RP-FG-.####",
+			},
+		).name
+
+		first_receipt = make_stock_entry(item_code=rm, target=warehouse, qty=30, basic_rate=200)
+		first_parent = get_batch_from_bundle(first_receipt.items[0].serial_and_batch_bundle)
+		second_receipt = make_stock_entry(item_code=rm, target=warehouse, qty=20, basic_rate=200)
+		second_parent = get_batch_from_bundle(second_receipt.items[0].serial_and_batch_bundle)
+
+		repack = frappe.new_doc("Stock Entry")
+		repack.stock_entry_type = "Batch Split"
+		repack.company = "_Test Company"
+		repack.weight_per_piece = 10
+		repack.append("items", {"item_code": rm, "qty": 50, "s_warehouse": warehouse})
+		repack.append("items", {"item_code": fg, "qty": 50, "t_warehouse": warehouse, "is_finished_item": 1})
+		repack.insert()
+		repack.submit()
+
+		fg_row = next(row for row in repack.items if row.item_code == fg)
+		entries = frappe.get_all(
+			"Serial and Batch Entry",
+			filters={"parent": fg_row.serial_and_batch_bundle},
+			fields=["batch_no", "qty"],
+		)
+
+		self.assertEqual(len(entries), 5)
+		parent_wise_pieces = {}
+		for entry in entries:
+			self.assertEqual(flt(entry.qty), 10.0)
+			parent = frappe.db.get_value("Batch", entry.batch_no, "parent_batch")
+			parent_wise_pieces[parent] = parent_wise_pieces.get(parent, 0) + 1
+
+		self.assertEqual(parent_wise_pieces, {first_parent: 3, second_parent: 2})
+
+		repack.reload()
+		repack.cancel()
+
+		for entry in entries:
+			self.assertTrue(frappe.db.exists("Batch", entry.batch_no))
+			self.assertTrue(frappe.db.get_value("Batch", entry.batch_no, "parent_batch"))
+
+	def test_batch_split_requires_single_batch_input(self):
+		if not frappe.db.exists("Stock Entry Type", "Batch Split"):
+			frappe.new_doc("Stock Entry Type", purpose="Repack", batch_split=1).insert(
+				set_name="Batch Split", ignore_permissions=True
+			)
+
+		warehouse = "_Test Warehouse - _TC"
+		items = {}
+		for suffix in ("RM A", "RM B", "FG C"):
+			items[suffix] = make_item(
+				f"Batch Split Multi {suffix}",
+				{
+					"is_stock_item": 1,
+					"has_batch_no": 1,
+					"create_new_batch": 1,
+					"batch_number_series": f"BS-M-{suffix[-1]}-.####",
+				},
+			).name
+			if suffix != "FG C":
+				make_stock_entry(item_code=items[suffix], target=warehouse, qty=10, basic_rate=100)
+
+		repack = frappe.new_doc("Stock Entry")
+		repack.stock_entry_type = "Batch Split"
+		repack.company = "_Test Company"
+		repack.weight_per_piece = 10
+		repack.append("items", {"item_code": items["RM A"], "qty": 10, "s_warehouse": warehouse})
+		repack.append("items", {"item_code": items["RM B"], "qty": 10, "s_warehouse": warehouse})
+		repack.append(
+			"items", {"item_code": items["FG C"], "qty": 20, "t_warehouse": warehouse, "is_finished_item": 1}
+		)
+		repack.insert()
+
+		self.assertRaises(frappe.ValidationError, repack.submit)
+
+	def test_batch_split_requires_whole_piece_capacity(self):
+		original_value = frappe.db.get_single_value(
+			"Stock Settings", "auto_create_serial_and_batch_bundle_for_outward"
+		)
+		frappe.db.set_single_value("Stock Settings", "auto_create_serial_and_batch_bundle_for_outward", 1)
+		self.addCleanup(
+			frappe.db.set_single_value,
+			"Stock Settings",
+			"auto_create_serial_and_batch_bundle_for_outward",
+			original_value,
+		)
+
+		if not frappe.db.exists("Stock Entry Type", "Batch Split"):
+			frappe.new_doc("Stock Entry Type", purpose="Repack", batch_split=1).insert(
+				set_name="Batch Split", ignore_permissions=True
+			)
+
+		warehouse = "_Test Warehouse - _TC"
+		items = {}
+		for suffix in ("RM", "FG"):
+			items[suffix] = make_item(
+				f"Batch Split Capacity {suffix}",
+				{
+					"is_stock_item": 1,
+					"has_batch_no": 1,
+					"create_new_batch": 1,
+					"batch_number_series": f"BS-CAP-{suffix}-.####",
+				},
+			).name
+
+		make_stock_entry(item_code=items["RM"], target=warehouse, qty=25, basic_rate=200)
+		make_stock_entry(item_code=items["RM"], target=warehouse, qty=25, basic_rate=200)
+
+		repack = frappe.new_doc("Stock Entry")
+		repack.stock_entry_type = "Batch Split"
+		repack.company = "_Test Company"
+		repack.weight_per_piece = 10
+		repack.append("items", {"item_code": items["RM"], "qty": 50, "s_warehouse": warehouse})
+		repack.append(
+			"items", {"item_code": items["FG"], "qty": 50, "t_warehouse": warehouse, "is_finished_item": 1}
+		)
+		repack.insert()
+
+		self.assertRaises(frappe.ValidationError, repack.submit)
 
 	def test_repack_with_additional_costs(self):
 		company = frappe.db.get_value("Warehouse", "Stores - TCP1", "company")
@@ -944,6 +1164,42 @@ class TestStockEntry(ERPNextTestSuite):
 		with self.assertRaises(frappe.ValidationError):
 			service._validate_no_excess_transfer()
 
+	def test_tracked_consumption_deducts_matching_attribution_bucket(self):
+		from erpnext.stock.doctype.stock_entry.services.manufacturing import ManufactureStockEntry
+
+		service = ManufactureStockEntry(frappe._dict())
+		serial_buckets = [
+			frappe._dict(qty=2, serial_nos=["SERIAL-1", "SERIAL-2"]),
+			frappe._dict(qty=2, serial_nos=["SERIAL-3", "SERIAL-4"]),
+		]
+		service._deduct_consumed_serial_nos(serial_buckets, ["SERIAL-3"])
+		self.assertEqual([bucket.qty for bucket in serial_buckets], [2, 1])
+		self.assertEqual(serial_buckets[1].serial_nos, ["SERIAL-4"])
+
+		batch_buckets = [
+			frappe._dict(qty=2, batches={"BATCH-1": 2}),
+			frappe._dict(qty=3, batches={"BATCH-2": 3}),
+		]
+		service._deduct_consumed_batch_qty(batch_buckets, "BATCH-2", 1)
+		self.assertEqual([bucket.qty for bucket in batch_buckets], [2, 2])
+		self.assertEqual(batch_buckets[1].batches["BATCH-2"], 2)
+
+	def test_consumption_prefers_exact_attribution_bucket(self):
+		from erpnext.stock.doctype.stock_entry.services.manufacturing import ManufactureStockEntry
+
+		service = ManufactureStockEntry(frappe._dict())
+		alternative = frappe._dict(original_item="REQUIRED-ITEM")
+		direct = frappe._dict(original_item=None)
+		service.available_materials = frappe._dict(
+			{("ITEM", "WIP", "REQUIRED-ITEM"): alternative, ("ITEM", "WIP", None): direct}
+		)
+
+		legacy_row = frappe._dict(item_code="ITEM", warehouse="WIP", original_item=None)
+		self.assertEqual(service._get_available_buckets(legacy_row), [direct, alternative])
+
+		attributed_row = frappe._dict(item_code="ITEM", warehouse="WIP", original_item="REQUIRED-ITEM")
+		self.assertEqual(service._get_available_buckets(attributed_row), [alternative])
+
 	@ERPNextTestSuite.change_settings("Manufacturing Settings", {"material_consumption": 1})
 	def test_work_order_manufacture_with_material_consumption(self):
 		from erpnext.manufacturing.doctype.work_order.mapper import (
@@ -1271,6 +1527,48 @@ class TestStockEntry(ERPNextTestSuite):
 				se_ok.reload()
 				se_ok.submit()
 				self.assertEqual(se_ok.docstatus, 1)
+
+	def test_duplicate_entry_for_work_order(self):
+		from erpnext.manufacturing.doctype.work_order.mapper import (
+			make_stock_entry as make_wo_stock_entry,
+		)
+		from erpnext.manufacturing.doctype.work_order.test_work_order import make_wo_order_test_record
+
+		wo = make_wo_order_test_record(qty=1)
+		make_stock_entry(item_code="_Test Item", target="Stores - _TC", qty=10, basic_rate=100)
+		make_stock_entry(
+			item_code="_Test Item Home Desktop 100", target="Stores - _TC", qty=10, basic_rate=100
+		)
+
+		transfer = frappe.get_doc(make_wo_stock_entry(wo.name, "Material Transfer for Manufacture", 1))
+		for d in transfer.get("items"):
+			d.s_warehouse = "Stores - _TC"
+		transfer.insert()
+		transfer.submit()
+
+		mfg = frappe.get_doc(make_wo_stock_entry(wo.name, "Manufacture", 1))
+		mfg.insert()
+
+		duplicate = frappe.get_doc(make_wo_stock_entry(wo.name, "Manufacture", 1))
+		self.assertRaises(DuplicateEntryForWorkOrderError, duplicate.insert)
+
+		with self.change_settings(
+			"Manufacturing Settings", {"overproduction_percentage_for_work_order": 100}
+		):
+			within_allowance = frappe.get_doc(make_wo_stock_entry(wo.name, "Manufacture", 1))
+			within_allowance.insert()
+
+	def test_manufacture_blocked_without_manufactured_qty(self):
+		from erpnext.manufacturing.doctype.work_order.mapper import (
+			make_stock_entry as make_wo_stock_entry,
+		)
+		from erpnext.manufacturing.doctype.work_order.test_work_order import make_wo_order_test_record
+
+		wo = make_wo_order_test_record(qty=1, source_warehouse="_Test Warehouse - _TC", skip_transfer=1)
+
+		mfg = frappe.get_doc(make_wo_stock_entry(wo.name, "Manufacture", 1))
+		mfg.fg_completed_qty = 0
+		self.assertRaises(ManufacturedQtyMandatoryError, mfg.insert)
 
 	@ERPNextTestSuite.change_settings("Stock Settings", {"action_if_quality_inspection_is_rejected": "Stop"})
 	def test_quality_inspection_required_for_manufacture(self):

@@ -11,6 +11,7 @@ existing imports of ``...services.material_planning`` keep working through here.
 import copy
 import json
 from collections import defaultdict
+from decimal import ROUND_CEILING, Decimal
 
 import frappe
 from frappe import _, msgprint
@@ -160,6 +161,7 @@ def get_items_for_material_requests(
 	mr_items = _apply_other_locations(
 		doc, mr_items, warehouses, ignore_ordered_qty, get_parent_warehouse_data
 	)
+	_set_default_suppliers(mr_items, doc.get("company"))
 
 	if not mr_items:
 		_warn_no_mr_items(doc)
@@ -463,6 +465,59 @@ def _apply_other_locations(doc, mr_items, warehouses, ignore_ordered_qty, get_pa
 	return new_mr_items
 
 
+def _set_default_suppliers(mr_items, company):
+	procurement_types = ("Purchase", "Subcontracting")
+	items = {
+		row.get("item_code") for row in mr_items if row.get("material_request_type") in procurement_types
+	}
+	if not items:
+		return
+
+	lead_time_suppliers = _get_default_lead_time_suppliers(items)
+	item_default_suppliers = _get_item_default_suppliers(items, company)
+
+	for row in mr_items:
+		if row.get("material_request_type") not in procurement_types or row.get("supplier"):
+			continue
+
+		item_code = row.get("item_code")
+		supplier = lead_time_suppliers.get(item_code) or item_default_suppliers.get(item_code)
+		if supplier:
+			row["supplier"] = supplier
+
+
+def _get_default_lead_time_suppliers(items):
+	table = frappe.qb.DocType("Item Lead Time Supplier")
+	rows = (
+		frappe.qb.from_(table)
+		.select(table.parent, table.supplier)
+		.where(
+			table.parent.isin(list(items)) & (table.parenttype == "Item Lead Time") & (table.is_default == 1)
+		)
+		.run(as_dict=True)
+	)
+	return {row.parent: row.supplier for row in rows}
+
+
+def _get_item_default_suppliers(items, company):
+	if not company:
+		return {}
+
+	table = frappe.qb.DocType("Item Default")
+	rows = (
+		frappe.qb.from_(table)
+		.select(table.parent, table.default_supplier)
+		.where(
+			table.parent.isin(list(items))
+			& (table.parenttype == "Item")
+			& (table.company == company)
+			& table.default_supplier.isnotnull()
+		)
+		.run(as_dict=True)
+	)
+	return {row.parent: row.default_supplier for row in rows}
+
+
 def _warn_no_mr_items(doc):
 	to_enable = frappe.bold(frappe.get_meta("Production Plan").get_field("ignore_existing_ordered_qty").label)
 	warehouse = frappe.bold(doc.get("for_warehouse"))
@@ -493,8 +548,16 @@ def get_material_request_items(
 	)
 	item_group_defaults = get_item_group_defaults(row.item_code, company)
 	conversion_factor = _mr_purchase_conversion_factor(row)
+	min_order_qty = flt(row.get("min_order_qty")) if doc.get("consider_minimum_order_qty") else 0
 	return _material_request_item_row(
-		row, sales_order, target_warehouse, bin_dict, required_qty, conversion_factor, item_group_defaults
+		row,
+		sales_order,
+		target_warehouse,
+		bin_dict,
+		required_qty,
+		conversion_factor,
+		item_group_defaults,
+		min_order_qty,
 	)
 
 
@@ -533,11 +596,22 @@ def _adjust_required_qty_for_uom(row, required_qty):
 					row["purchase_uom"], row["stock_uom"], row.item_code
 				)
 			)
-			required_qty = required_qty / row["conversion_factor"]
 
 	if frappe.db.get_value("UOM", row["purchase_uom"], "must_be_whole_number"):
 		required_qty = ceil(required_qty)
 	return required_qty
+
+
+def _quantity_in_purchase_uom(required_qty, conversion_factor, min_order_qty=0):
+	"""Convert to purchase UOM; a binding minimum order qty takes the smallest
+	representable quantity whose stock equivalent still meets it."""
+	precision = frappe.get_precision("Material Request Plan Item", "quantity")
+	quantity = flt(required_qty / conversion_factor, precision)
+	if min_order_qty and quantity * conversion_factor < min_order_qty <= required_qty:
+		grid = Decimal(10) ** -precision
+		exact = Decimal(str(min_order_qty)) / Decimal(str(conversion_factor))
+		quantity = flt(exact.quantize(grid, rounding=ROUND_CEILING))
+	return quantity
 
 
 def _mr_purchase_conversion_factor(row):
@@ -552,7 +626,14 @@ def _mr_purchase_conversion_factor(row):
 
 
 def _material_request_item_row(
-	row, sales_order, warehouse, bin_dict, required_qty, conversion_factor, item_group_defaults
+	row,
+	sales_order,
+	warehouse,
+	bin_dict,
+	required_qty,
+	conversion_factor,
+	item_group_defaults,
+	min_order_qty=0,
 ):
 	warehouse = (
 		warehouse
@@ -563,7 +644,7 @@ def _material_request_item_row(
 	return {
 		"item_code": row.item_code,
 		"item_name": row.item_name,
-		"quantity": required_qty / conversion_factor,
+		"quantity": _quantity_in_purchase_uom(required_qty, conversion_factor, min_order_qty),
 		"conversion_factor": conversion_factor,
 		"required_bom_qty": row.get("qty"),
 		"stock_uom": row.get("stock_uom"),
@@ -640,7 +721,8 @@ def _add_remaining_purchase_request(item, new_mr_items, required_qty, consider_m
 	if frappe.db.get_value("UOM", purchase_uom, "must_be_whole_number"):
 		required_qty = ceil(required_qty)
 
-	item["quantity"] = required_qty / item.get("conversion_factor")
+	min_order_qty = flt(item.get("min_order_qty")) if consider_minimum_order_qty else 0
+	item["quantity"] = _quantity_in_purchase_uom(required_qty, item.get("conversion_factor"), min_order_qty)
 	new_mr_items.append(item)
 
 

@@ -476,6 +476,8 @@ frappe.ui.form.on("Payment Entry", {
 				return {
 					query: "erpnext.controllers.queries.employee_query",
 				};
+			} else if (["Customer", "Supplier"].includes(frm.doc.party_type)) {
+				return erpnext.queries.party(frm.doc);
 			} else if (frm.doc.party_type == "Shareholder") {
 				return {
 					filters: {
@@ -1277,8 +1279,14 @@ frappe.ui.form.on("Payment Entry", {
 		await frappe.after_ajax();
 		const base_paid_amount = frm.doc.base_paid_amount || 0;
 		const base_received_amount = frm.doc.base_received_amount || 0;
+		let other_deductions = 0;
+		if (frm.doc.payment_type === "Internal Transfer") {
+			other_deductions = (frm.doc.deductions || [])
+				.filter((row) => !row.is_exchange_gain_loss)
+				.reduce((sum, row) => sum + flt(row.amount), 0);
+		}
 		const exchange_gain_loss = flt(
-			base_paid_amount - base_received_amount,
+			base_paid_amount - base_received_amount - other_deductions,
 			get_deduction_amount_precision()
 		);
 
@@ -1292,7 +1300,10 @@ frappe.ui.form.on("Payment Entry", {
 
 		if (!row) {
 			const company_defaults = frappe.get_doc(":Company", frm.doc.company);
+			const is_single_currency =
+				frm.doc.paid_from_account_currency === frm.doc.paid_to_account_currency;
 			const account =
+				(is_single_currency && company_defaults?.bank_charges_account) ||
 				company_defaults?.[account_fieldname] ||
 				(await prompt_for_missing_account(frm, account_fieldname));
 
@@ -1847,16 +1858,24 @@ frappe.ui.form.on("Payment Entry Deduction", {
 	before_deductions_remove: function (doc, cdt, cdn) {
 		const row = frappe.get_doc(cdt, cdn);
 		if (row.is_exchange_gain_loss && row.amount) {
-			frappe.throw(__("Cannot delete Exchange Gain/Loss row"));
+			frappe.throw(__("Cannot delete a system-generated deduction row"));
 		}
 	},
 
 	amount: function (frm) {
-		frm.events.set_unallocated_amount(frm);
+		if (frm.doc.payment_type === "Internal Transfer") {
+			frm.events.set_exchange_gain_loss_deduction(frm);
+		} else {
+			frm.events.set_unallocated_amount(frm);
+		}
 	},
 
 	deductions_remove: function (frm) {
-		frm.events.set_unallocated_amount(frm);
+		if (frm.doc.payment_type === "Internal Transfer") {
+			frm.events.set_exchange_gain_loss_deduction(frm);
+		} else {
+			frm.events.set_unallocated_amount(frm);
+		}
 	},
 });
 

@@ -13,7 +13,7 @@
 {% endblock %}
 
 {% block header_actions %}
-{% if doc.items %}
+{% if doc.items and not doc.rfq_links %}
 <button class="btn btn-sm"
     type="button"
     style="background: #b7b973; color: #1c1b18; border: none; font-weight: 600; padding: 8px 20px; border-radius: 6px;">
@@ -45,10 +45,7 @@
 </div>
 
 <div class="row">
-    <div class="col-6">
-        <div class="rfq-supplier">{{ doc.supplier }}</div>
-	</div>
-    <div class="col-6 text-muted text-right h6">
+    <div class="col-12 text-muted text-right h6">
         {{ doc.get_formatted("transaction_date") }}
     </div>
 </div>

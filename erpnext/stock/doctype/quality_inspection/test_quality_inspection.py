@@ -2,6 +2,7 @@
 # See license.txt
 
 from contextlib import contextmanager
+from unittest.mock import patch
 
 import frappe
 from frappe.utils import nowdate
@@ -77,6 +78,27 @@ class TestQualityInspection(ERPNextTestSuite):
 
 		qa.delete()
 		dn.delete()
+
+	def test_doc_update_published_for_reference_on_submit(self):
+		"""Submitting a QI publishes doc_update so open reference forms resync their timestamp."""
+		dn = create_delivery_note(item_code="_Test Item with QA", do_not_submit=True)
+		qa = create_quality_inspection(
+			reference_type="Delivery Note", reference_name=dn.name, do_not_submit=True
+		)
+
+		with patch.object(frappe, "publish_realtime") as publish_realtime:
+			qa.submit()
+
+		reference_updates = [
+			call
+			for call in publish_realtime.call_args_list
+			if call.args and call.args[0] == "doc_update" and call.kwargs.get("docname") == dn.name
+		]
+		self.assertEqual(len(reference_updates), 1)
+
+		message = reference_updates[0].args[1]
+		self.assertEqual(message["doctype"], "Delivery Note")
+		self.assertEqual(message["modified"], frappe.db.get_value("Delivery Note", dn.name, "modified"))
 
 	def test_value_based_qi_readings(self):
 		# Test QI based on acceptance values (Non formula)
@@ -506,8 +528,6 @@ class TestQualityInspection(ERPNextTestSuite):
 		"""Submitting a QI with reference_type 'Job Card' writes its name onto the
 		Job Card's quality_inspection field (the Job Card branch of
 		QualityInspection.update_qc_reference)."""
-		create_item("_Test Item")
-
 		# Job Card whose production_item matches the QI item_code -> must be updated.
 		matching_jc = make_minimal_job_card(production_item="_Test Item")
 		# Job Card with a different production_item -> the production_item filter must
@@ -532,7 +552,6 @@ class TestQualityInspection(ERPNextTestSuite):
 	def test_qi_job_card_reference_respects_production_item(self):
 		"""A QI referencing a Job Card by name but whose item_code does not match the
 		Job Card's production_item must NOT update that Job Card."""
-		create_item("_Test Item")
 		mismatch_item = create_item("_Test Item Mismatch QC " + frappe.utils.random_string(6)).name
 
 		# Job Card produces a different item than the QI's item_code.

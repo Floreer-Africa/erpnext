@@ -26,7 +26,7 @@ from frappe.utils import (
 )
 
 import erpnext
-from erpnext.stock.doctype.bin.bin import update_qty as update_bin_qty
+from erpnext.stock.doctype.bin.bin import update_qty_from_sle
 from erpnext.stock.doctype.inventory_dimension.inventory_dimension import get_inventory_dimensions
 from erpnext.stock.doctype.serial_and_batch_bundle.serial_and_batch_bundle import (
 	get_auto_batch_nos,
@@ -38,7 +38,6 @@ from erpnext.stock.doctype.stock_reservation_entry.stock_reservation_entry impor
 from erpnext.stock.utils import (
 	get_combine_datetime,
 	get_incoming_outgoing_rate_for_cancel,
-	get_incoming_rate,
 	get_or_make_bin,
 	get_serial_nos_data,
 	get_stock_balance,
@@ -138,7 +137,7 @@ def make_sl_entries(sl_entries, allow_negative_stock=False, via_landed_cost_vouc
 	        such cases certain validations need to be ignored (like negative
 	                        stock)
 	"""
-	from erpnext.controllers.stock_controller import future_sle_exists
+	from erpnext.controllers.stock_controller import future_sle_exists, invalidate_future_sle_cache
 
 	if sl_entries:
 		# Sorted so two vouchers touching the same pairs can't take the gates in opposite order.
@@ -173,9 +172,10 @@ def make_sl_entries(sl_entries, allow_negative_stock=False, via_landed_cost_vouc
 					)
 					sle["outgoing_rate"] = 0.0
 
-			if sle.get("actual_qty") or sle.get("voucher_type") == "Stock Reconciliation":
-				sle_doc = make_entry(sle, allow_negative_stock, via_landed_cost_voucher)
+			if not (sle.get("actual_qty") or sle.get("voucher_type") == "Stock Reconciliation"):
+				continue
 
+			sle_doc = make_entry(sle, allow_negative_stock, via_landed_cost_voucher)
 			args = sle_doc.as_dict()
 			args["posting_datetime"] = get_combine_datetime(args.posting_date, args.posting_time)
 
@@ -190,11 +190,13 @@ def make_sl_entries(sl_entries, allow_negative_stock=False, via_landed_cost_vouc
 				repost_current_voucher(
 					args, allow_negative_stock, via_landed_cost_voucher, cancelled=cancelled
 				)
-				update_bin_qty(bin_name, args)
+				update_qty_from_sle(bin_name, args)
 			else:
 				frappe.msgprint(
 					_("Item {0} ignored since it is not a stock item").format(args.get("item_code"))
 				)
+
+		invalidate_future_sle_cache(sl_entries[0].get("voucher_type"), sl_entries[0].get("voucher_no"))
 
 
 def repost_current_voucher(args, allow_negative_stock=False, via_landed_cost_voucher=False, cancelled=False):
@@ -712,16 +714,6 @@ class update_entries_after:
 		previous_sle = get_previous_sle_of_current_voucher(args)
 		if previous_sle:
 			self.prev_sle_dict[(args.get("item_code"), args.get("warehouse"))] = previous_sle
-		else:
-			self.prev_sle_dict[(args.get("item_code"), args.get("warehouse"))] = frappe._dict(
-				{
-					"qty_after_transaction": 0.0,
-					"valuation_rate": 0.0,
-					"stock_value": 0.0,
-					"prev_stock_value": 0.0,
-					"stock_queue": [],
-				}
-			)
 
 		warehouse_dict.previous_sle = previous_sle
 
@@ -1460,23 +1452,7 @@ class update_entries_after:
 					and not sle.get("batch_no")
 					and not sle.get("serial_and_batch_bundle")
 				):
-					rate = get_incoming_rate(
-						{
-							"item_code": sle.item_code,
-							"warehouse": sle.warehouse,
-							"posting_date": sle.posting_date,
-							"posting_time": sle.posting_time,
-							"qty": sle.actual_qty,
-							"serial_no": sle.get("serial_no"),
-							"batch_no": sle.get("batch_no"),
-							"serial_and_batch_bundle": sle.get("serial_and_batch_bundle"),
-							"company": sle.company,
-							"voucher_type": sle.voucher_type,
-							"voucher_no": sle.voucher_no,
-							"allow_zero_valuation": self.allow_zero_rate,
-							"sle": sle.name,
-						}
-					)
+					rate = self.get_moving_average_rate_for_return(sle)
 
 					if not rate and sle.voucher_type in ["Delivery Note", "Sales Invoice"]:
 						rate = get_rate_for_return(
@@ -1544,6 +1520,38 @@ class update_entries_after:
 
 		return rate
 
+	def get_moving_average_rate_for_return(self, sle):
+		"""Rate just before this entry, taken from the in-memory running state so a
+		multi-line return never reads a sibling row of its own voucher."""
+		rate = flt(self.wh_data.valuation_rate)
+		if rate:
+			return rate
+
+		previous_sle = get_previous_sle_of_current_voucher(
+			frappe._dict(
+				item_code=sle.item_code,
+				warehouse=sle.warehouse,
+				posting_date=sle.posting_date,
+				posting_time=sle.posting_time,
+				voucher_no=sle.voucher_no,
+			),
+			exclude_current_voucher=True,
+		)
+
+		rate = previous_sle.get("valuation_rate")
+		if rate is None:
+			rate = get_valuation_rate(
+				sle.item_code,
+				sle.warehouse,
+				sle.voucher_type,
+				sle.voucher_no,
+				self.allow_zero_rate,
+				currency=erpnext.get_company_currency(sle.company),
+				company=sle.company,
+			)
+
+		return flt(rate)
+
 	def update_outgoing_rate_on_transaction(self, sle):
 		"""
 		Update outgoing rate in Stock Entry, Delivery Note, Sales Invoice and Sales Return
@@ -1589,12 +1597,14 @@ class update_entries_after:
 		stock_entry = frappe.get_lazy_doc("Stock Entry", voucher_no, for_update=True)
 		stock_entry.calculate_rate_and_amount(reset_outgoing_rate=False, raise_error_if_no_rate=False)
 		stock_entry.db_update()
+		update_additional_cost_rows = bool(stock_entry.get("additional_costs"))
 		for d in stock_entry.items:
-			# Update only the row that matches the voucher_detail_no or the row containing the FG/Scrap Item.
+			# Additional costs are redistributed across all incoming rows.
 			if (
 				d.name == voucher_detail_no
 				or (not d.s_warehouse and d.t_warehouse)
 				or stock_entry.purpose in ["Manufacture", "Repack"]
+				or (update_additional_cost_rows and d.t_warehouse)
 			):
 				d.db_update()
 
@@ -1919,18 +1929,6 @@ class update_entries_after:
 			else:
 				raise NegativeStockError(message)
 
-	def update_bin_data(self, sle):
-		bin_name = get_or_make_bin(sle.item_code, sle.warehouse)
-		values_to_update = {
-			"actual_qty": sle.qty_after_transaction,
-			"stock_value": sle.stock_value,
-		}
-
-		if sle.valuation_rate is not None:
-			values_to_update["valuation_rate"] = sle.valuation_rate
-
-		frappe.db.set_value("Bin", bin_name, values_to_update)
-
 	def update_bin(self):
 		# update bin for each warehouse
 		for (item_code, warehouse), data in self.prev_sle_dict.items():
@@ -1944,6 +1942,30 @@ class update_entries_after:
 				updated_values["valuation_rate"] = flt(data.valuation_rate)
 
 			frappe.db.set_value("Bin", bin_name, updated_values, update_modified=True)
+
+		self.reset_bin_without_stock_ledger_entries()
+
+	def reset_bin_without_stock_ledger_entries(self):
+		"""Reset the bin when its ledger has no entries left, prev_sle_dict never covers that case."""
+		item_code, warehouse = self.args.get("item_code"), self.args.get("warehouse")
+		if not item_code or not warehouse or (item_code, warehouse) in self.prev_sle_dict:
+			return
+
+		if frappe.db.exists(
+			"Stock Ledger Entry", {"item_code": item_code, "warehouse": warehouse, "is_cancelled": 0}
+		):
+			return
+
+		bin_name = frappe.db.get_value("Bin", {"item_code": item_code, "warehouse": warehouse})
+		if not bin_name:
+			return
+
+		frappe.db.set_value(
+			"Bin",
+			bin_name,
+			{"actual_qty": 0.0, "stock_value": 0.0, "valuation_rate": 0.0},
+			update_modified=True,
+		)
 
 
 def get_sle_against_current_voucher(kwargs):
@@ -2060,9 +2082,6 @@ def get_stock_ledger_entries(
 
 		else:
 			conditions += " and warehouse = %(warehouse)s"
-
-	elif previous_sle.get("warehouse_condition"):
-		conditions += " and " + previous_sle.get("warehouse_condition")
 
 	if check_serial_no and previous_sle.get("serial_no"):
 		# conditions += " and serial_no like {}".format(frappe.db.escape('%{0}%'.format(previous_sle.get("serial_no"))))
@@ -2380,9 +2399,6 @@ def get_next_stock_reco(kwargs):
 		.orderby(sle.creation)
 		.limit(1)
 	)
-
-	if kwargs.get("batch_no"):
-		query = query.where(sle.batch_no == kwargs.get("batch_no"))
 
 	return query.run(as_dict=True)
 
