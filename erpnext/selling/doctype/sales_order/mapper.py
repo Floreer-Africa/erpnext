@@ -307,8 +307,10 @@ def make_delivery_note(
 				return False
 
 		return (
-			(abs(doc.delivered_qty) < abs(doc.qty)) or is_unit_price_row(doc)
-		) and doc.delivered_by_supplier != 1
+			((abs(doc.delivered_qty) < abs(doc.qty)) or is_unit_price_row(doc))
+			and doc.delivered_by_supplier != 1
+			and not cint(doc.skip_delivery)
+		)
 
 	def update_item(source, target, source_parent):
 		target.base_amount = (flt(source.qty) - flt(source.delivered_qty)) * flt(source.base_rate)
@@ -421,12 +423,19 @@ def make_delivery_note(
 	return target_doc
 
 
+def get_qty_net_of_returns(so_item) -> float:
+	"""Return the ordered quantity billable after returns and re-deliveries."""
+	qty = flt(so_item.qty)
+
+	return min(qty, max(qty - flt(so_item.returned_qty), flt(so_item.delivered_qty)))
+
+
 @frappe.whitelist()
 def make_sales_invoice(
 	source_name: str,
 	target_doc: str | dict | Document | None = None,
-	ignore_permissions: bool = False,
 	args: str | dict | None = None,
+	ignore_permissions: bool = False,
 ):
 	if args is None:
 		args = {}
@@ -434,9 +443,39 @@ def make_sales_invoice(
 
 	# 0 qty is accepted, as the qty is uncertain for some items
 	has_unit_price_items = frappe.db.get_value("Sales Order", source_name, "has_unit_price_items")
+	billed_qty_by_item = None
+	pending_qty_by_item = {}
 
 	def is_unit_price_row(source):
 		return has_unit_price_items and source.qty == 0
+
+	def get_billed_qty_by_item():
+		nonlocal billed_qty_by_item
+
+		if billed_qty_by_item is None:
+			invoice_item = frappe.qb.DocType("Sales Invoice Item")
+			sales_order_item = frappe.qb.DocType("Sales Order Item")
+			rows = (
+				frappe.qb.from_(invoice_item)
+				.inner_join(sales_order_item)
+				.on(invoice_item.so_detail == sales_order_item.name)
+				.select(invoice_item.so_detail, Sum(invoice_item.qty).as_("qty"))
+				.where((invoice_item.docstatus == 1) & (sales_order_item.parent == source_name))
+				.groupby(invoice_item.so_detail)
+			).run(as_dict=True)
+			billed_qty_by_item = {row.so_detail: flt(row.qty) for row in rows}
+
+		return billed_qty_by_item
+
+	def get_pending_qty(source):
+		if source.name not in pending_qty_by_item:
+			billable_qty = get_qty_net_of_returns(source)
+			if source.qty and source.billed_amt:
+				billable_qty -= get_billed_qty_by_item().get(source.name, 0)
+
+			pending_qty_by_item[source.name] = max(flt(billable_qty, source.precision("qty")), 0)
+
+		return pending_qty_by_item[source.name]
 
 	def postprocess(source, target):
 		set_missing_values(source, target)
@@ -476,15 +515,6 @@ def make_sales_invoice(
 		target.debit_to = get_party_account("Customer", source.customer, source.company)
 
 	def update_item(source, target, source_parent):
-		def get_billed_qty(so_item_name):
-			table = frappe.qb.DocType("Sales Invoice Item")
-			query = (
-				frappe.qb.from_(table)
-				.select(Sum(table.qty).as_("qty"))
-				.where((table.docstatus == 1) & (table.so_detail == so_item_name))
-			)
-			return query.run(pluck="qty")[0] or 0
-
 		if source_parent.has_unit_price_items:
 			# 0 Amount rows (as seen in Unit Price Items) should be mapped as it is
 			pending_amount = flt(source.amount) - flt(source.billed_amt)
@@ -493,11 +523,7 @@ def make_sales_invoice(
 			target.amount = flt(source.amount) - flt(source.billed_amt)
 
 		target.base_amount = target.amount * flt(source_parent.conversion_rate)
-		target.qty = (
-			source.qty - get_billed_qty(source.name)
-			if (source.qty and source.billed_amt)
-			else (source.qty if is_unit_price_row(source) else source.qty - source.returned_qty)
-		)
+		target.qty = source.qty if is_unit_price_row(source) else get_pending_qty(source)
 
 		if source_parent.project:
 			target.cost_center = frappe.db.get_value("Project", source_parent.project, "cost_center")
@@ -575,13 +601,17 @@ def make_sales_invoice(
 					"parent": "sales_order",
 				},
 				"postprocess": update_item,
-				"condition": lambda doc: (
+				"condition": lambda doc: not args.get("skip_item_mapping")
+				and select_item(doc)
+				and (
 					True
 					if is_unit_price_row(doc)
-					else (doc.qty and (doc.base_amount == 0 or abs(doc.billed_amt) < abs(doc.amount)))
-				)
-				and select_item(doc)
-				and not args.get("skip_item_mapping"),
+					else (
+						doc.qty
+						and (doc.base_amount == 0 or abs(doc.billed_amt) < abs(doc.amount))
+						and get_pending_qty(doc) > 0
+					)
+				),
 			},
 			"Sales Taxes and Charges": {
 				"doctype": "Sales Taxes and Charges",
@@ -845,6 +875,8 @@ def set_delivery_date(items: list, sales_order: str) -> None:
 @frappe.whitelist(methods=["POST"])
 def make_work_orders(items: str | dict, sales_order: str, company: str, project: str | None = None):
 	"""Make Work Orders against the given Sales Order for the given `items`"""
+	frappe.has_permission("Sales Order", "read", sales_order, throw=True)
+
 	items = frappe.parse_json(items).get("items")
 	out = []
 

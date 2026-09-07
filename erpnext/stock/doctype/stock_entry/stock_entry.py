@@ -38,11 +38,18 @@ from erpnext.stock.utils import get_incoming_rate
 
 from .services.disassemble import DisassembleStockEntry
 from .services.manufacturing import (
+	DuplicateEntryForWorkOrderError,
+	ManufacturedQtyMandatoryError,
 	ManufactureStockEntry,
 	MaterialConsumptionForManufactureStockEntry,
+	OperationsNotCompleteError,
 	RepackStockEntry,
 )
-from .services.material_receipt_issue import MaterialIssueStockEntry, MaterialReceiptStockEntry
+from .services.material_receipt_issue import (
+	MaterialIssueStockEntry,
+	MaterialReceiptStockEntry,
+	SourceOnlyStockEntry,
+)
 from .services.material_transfer import (
 	MaterialRequestStockEntry,
 	MaterialTransferForManufactureStockEntry,
@@ -109,6 +116,7 @@ class StockEntry(StockController, SubcontractingInwardController):
 		from_warehouse: DF.Link | None
 		inspection_required: DF.Check
 		is_additional_transfer_entry: DF.Check
+		is_fg_conversion: DF.Check
 		is_opening: DF.Literal["No", "Yes"]
 		is_return: DF.Check
 		items: DF.Table[StockEntryDetail]
@@ -162,6 +170,7 @@ class StockEntry(StockController, SubcontractingInwardController):
 		total_outgoing_value: DF.Currency
 		use_multi_level_bom: DF.Check
 		value_difference: DF.Currency
+		weight_per_piece: DF.Float
 		work_order: DF.Link | None
 	# end: auto-generated types
 
@@ -213,6 +222,10 @@ class StockEntry(StockController, SubcontractingInwardController):
 			"Send to Subcontractor": SendToSubcontractorStockEntry,
 			"Material Issue": MaterialIssueStockEntry,
 			"Material Receipt": MaterialReceiptStockEntry,
+			"Receive from Customer": MaterialReceiptStockEntry,
+			"Return Raw Material to Customer": SourceOnlyStockEntry,
+			"Subcontracting Delivery": SourceOnlyStockEntry,
+			"Subcontracting Return": MaterialReceiptStockEntry,
 		}
 
 		self.purpose_cls = purpose_map.get(self.purpose)
@@ -310,6 +323,13 @@ class StockEntry(StockController, SubcontractingInwardController):
 			else:
 				self.validate_job_card_fg_item()
 
+		# Must run after set_transfer_qty() and mark_finished_and_secondary_items() so the
+		# qty parity and conversion cap checks see recomputed transfer_qty on edited rows.
+		if self.is_fg_conversion:
+			if self.purpose != "Repack":
+				frappe.throw(_("A finished good conversion entry must have the purpose 'Repack'."))
+			self.purpose_cls(self).validate_fg_conversion()
+
 		# Disassembly rows are fully derived from the source manufacture entry / work order;
 		# verify the posted stock quantities have not been tampered with (raw-material minting).
 		# Must run after set_transfer_qty() so row.transfer_qty reflects qty * conversion_factor.
@@ -319,6 +339,7 @@ class StockEntry(StockController, SubcontractingInwardController):
 		self.validate_batch()
 		self.validate_inspection()
 		self.validate_fg_completed_qty()
+		self.validate_job_card_pending_production()
 		self.validate_difference_account()
 		self.validate_job_card_item()
 		self.set_purpose_for_stock_entry()
@@ -336,6 +357,9 @@ class StockEntry(StockController, SubcontractingInwardController):
 
 	def before_submit(self):
 		StockEntrySABB(self).make_serial_and_batch_bundle_for_outward()
+
+		if self.purpose_cls and hasattr(self.purpose_cls, "before_submit"):
+			self.purpose_cls(self).before_submit()
 
 	def on_submit(self):
 		if self.purpose_cls and hasattr(self.purpose_cls, "on_submit"):
@@ -793,7 +817,9 @@ class StockEntry(StockController, SubcontractingInwardController):
 	def _validate_no_raw_materials_in_manufacture_entry(self, settings):
 		for item in self.items:
 			if not item.is_finished_item and not item.secondary_item_type and not item.is_legacy_scrap_item:
-				label = frappe.get_meta(settings.doctype).get_label("get_rm_cost_from_consumption_entry")
+				label = frappe.get_meta(settings.doctype).get_translated_label(
+					"get_rm_cost_from_consumption_entry"
+				)
 				frappe.throw(
 					_(
 						"Row {0}: As {1} is enabled, raw materials cannot be added to {2} entry. Use {3} entry to consume raw materials."
@@ -961,7 +987,7 @@ class StockEntry(StockController, SubcontractingInwardController):
 
 		for d in self.get("items"):
 			if d.is_finished_item:
-				if not self.work_order:
+				if not self.work_order or self.is_fg_conversion:
 					# Independent MFG Entry/ Repack Entry, no WO to match against
 					finished_items.append(d.item_code)
 					continue
@@ -1435,6 +1461,9 @@ class StockEntry(StockController, SubcontractingInwardController):
 
 	@frappe.whitelist()
 	def get_items(self):
+		if self.pick_list:
+			return
+
 		self.set("items", [])
 		if self.purpose_cls and hasattr(self.purpose_cls, "add_items"):
 			self.purpose_cls(self).add_items()
@@ -1452,22 +1481,14 @@ class StockEntry(StockController, SubcontractingInwardController):
 			return
 
 		precision = self.precision("process_loss_qty")
-		if self.work_order:
-			data = frappe.get_all(
-				"Work Order Operation",
-				filters={"parent": self.work_order},
-				fields=[{"MAX": "process_loss_qty", "as": "process_loss_qty"}],
+		process_loss_qty = self.get_pending_process_loss_qty()
+		if process_loss_qty and flt(self.process_loss_qty, precision) != flt(process_loss_qty, precision):
+			self.process_loss_qty = flt(process_loss_qty, precision)
+
+			frappe.msgprint(
+				_("The Process Loss Qty has been reset as per the job card's Process Loss Qty"),
+				alert=True,
 			)
-
-			if data and data[0].process_loss_qty:
-				process_loss_qty = data[0].process_loss_qty
-				if flt(self.process_loss_qty, precision) != flt(process_loss_qty, precision):
-					self.process_loss_qty = flt(process_loss_qty, precision)
-
-					frappe.msgprint(
-						_("The Process Loss Qty has been reset as per the job card's Process Loss Qty"),
-						alert=True,
-					)
 
 		if not self.process_loss_percentage and not self.process_loss_qty:
 			self.process_loss_percentage = frappe.get_cached_value(
@@ -1483,14 +1504,73 @@ class StockEntry(StockController, SubcontractingInwardController):
 				(flt(self.process_loss_qty) / flt(self.fg_completed_qty)) * 100
 			)
 
-	def set_work_order_details(self):
+	def validate_job_card_pending_production(self):
+		"""A draft created before other entries were submitted must not book more than the job
+		card still has left; without this, a stale draft over-produces the finished good."""
+		if self.purpose != "Manufacture" or not self.job_card:
+			return
+
+		if self._action == "update_after_submit":
+			return
+
+		job_card = frappe.get_doc("Job Card", self.job_card)
+		if job_card.is_corrective_job_card or job_card.is_subcontracted:
+			return
+
+		precision = frappe.get_precision("Stock Entry Detail", "qty")
+		pending_qty = flt(
+			flt(job_card.get_qty_to_produce())
+			- flt(job_card.manufactured_qty)
+			- flt(job_card.get_consumed_process_loss()),
+			precision,
+		)
+		finished_qty = flt(sum(flt(d.transfer_qty) for d in self.items if d.is_finished_item), precision)
+		entry_qty = flt(finished_qty + flt(self.process_loss_qty), precision)
+
+		if entry_qty > pending_qty:
+			uom = job_card.stock_uom
+			frappe.throw(
+				_(
+					"The Job Card {0} has only {1} left to produce, but this entry books {2} ({3} finished goods and {4} process loss). Cancel or update its other manufacture entries first."
+				).format(
+					frappe.bold(self.job_card),
+					frappe.bold(f"{pending_qty} {uom}"),
+					frappe.bold(f"{entry_qty} {uom}"),
+					f"{finished_qty} {uom}",
+					f"{flt(self.process_loss_qty, precision)} {uom}",
+				)
+			)
+
+	def get_pending_process_loss_qty(self):
+		"""Loss this entry should still book: the job card's unbooked loss when the entry
+		belongs to one, else the largest operation loss on the work order (legacy flow)."""
+		if self.job_card:
+			job_card = frappe.get_doc("Job Card", self.job_card)
+			return max(flt(job_card.process_loss_qty) - flt(job_card.get_consumed_process_loss()), 0)
+
 		if self.work_order:
-			# common validations
-			if self.pro_doc and not self.pro_doc.track_semi_finished_goods:
-				self.bom_no = self.pro_doc.bom_no
-			else:
-				# invalid work order
-				self.work_order = None
+			data = frappe.get_all(
+				"Work Order Operation",
+				filters={"parent": self.work_order},
+				fields=[{"MAX": "process_loss_qty", "as": "process_loss_qty"}],
+			)
+			return flt(data[0].process_loss_qty) if data else 0
+
+		return 0
+
+	def set_work_order_details(self):
+		if not self.work_order:
+			return
+
+		if self.pro_doc and self.is_fg_conversion:
+			return
+
+		# common validations
+		if self.pro_doc and not self.pro_doc.track_semi_finished_goods:
+			self.bom_no = self.pro_doc.bom_no
+		else:
+			# invalid work order
+			self.work_order = None
 
 	def get_bom_raw_materials(self, qty):
 		from erpnext.manufacturing.doctype.bom.bom import get_bom_items_as_dict

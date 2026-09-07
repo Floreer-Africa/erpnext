@@ -21,6 +21,18 @@ from .serial_batch import create_serial_and_batch_bundle
 from .stock_entry_base import BaseStockEntry
 
 
+class DuplicateEntryForWorkOrderError(frappe.ValidationError):
+	pass
+
+
+class ManufacturedQtyMandatoryError(frappe.ValidationError):
+	pass
+
+
+class OperationsNotCompleteError(frappe.ValidationError):
+	pass
+
+
 class BaseManufactureStockEntry(BaseStockEntry):
 	def set_default_warehouse(self):
 		for row in self.doc.items:
@@ -271,9 +283,17 @@ class ManufactureStockEntry(BaseManufactureStockEntry):
 		self.set_default_warehouse()
 		self.set_job_card_data()
 
+	def before_submit(self):
+		from .batch_split import BatchSplitFinishedGood
+
+		BatchSplitFinishedGood(self.doc).process()
+
 	def validate(self):
 		self.validate_warehouse()
 		self.validate_raw_materials_exists()
+		self.validate_manufactured_qty()
+		self.check_if_operations_completed()
+		self.check_duplicate_entry_for_work_order()
 		self.validate_component_and_quantities()
 		self.validate_finished_good_serial_batch_for_work_order()
 
@@ -380,6 +400,102 @@ class ManufactureStockEntry(BaseManufactureStockEntry):
 	def validate_work_order(self):
 		if not self.doc.work_order:
 			frappe.throw(_("Work Order is mandatory"))
+
+	def validate_manufactured_qty(self):
+		"""Without fg_completed_qty, submit never updates or validates the work order's produced qty."""
+		if not self.wo_doc or self.wo_doc.track_semi_finished_goods:
+			return
+
+		if not self.doc.fg_completed_qty:
+			frappe.throw(_("For Quantity (Manufactured Qty) is mandatory"), ManufacturedQtyMandatoryError)
+
+	def check_if_operations_completed(self):
+		"""Require operation (job card) completion before manufacture, so operating costs are captured."""
+		if not self.wo_doc or self.wo_doc.track_semi_finished_goods:
+			return
+
+		allowance_percentage = flt(
+			frappe.db.get_single_value("Manufacturing Settings", "overproduction_percentage_for_work_order")
+		)
+		total_completed_qty = flt(self.doc.fg_completed_qty) + flt(self.wo_doc.produced_qty)
+		precision = self.doc.precision("fg_completed_qty")
+
+		for row in self.wo_doc.operations:
+			allowed_qty = (
+				row.completed_qty + row.process_loss_qty + (allowance_percentage / 100 * row.completed_qty)
+			)
+			if flt(total_completed_qty, precision) > flt(allowed_qty, precision):
+				self.throw_operations_not_complete_error(row, total_completed_qty)
+
+	def throw_operations_not_complete_error(self, operation_row, total_completed_qty):
+		job_card = frappe.db.get_value(
+			"Job Card",
+			{"operation_id": operation_row.name, "docstatus": ("<", 2), "is_corrective_job_card": 0},
+			"name",
+		)
+		if not job_card:
+			frappe.throw(
+				_("Work Order {0}: Job Card not found for the operation {1}").format(
+					self.doc.work_order, operation_row.operation
+				)
+			)
+
+		frappe.throw(
+			_(
+				"Row #{0}: Operation {1} is not completed for {2} qty of finished goods in Work Order {3}. Please update operation status via Job Card {4}."
+			).format(
+				operation_row.idx,
+				bold(operation_row.operation),
+				bold(total_completed_qty),
+				get_link_to_form("Work Order", self.doc.work_order),
+				get_link_to_form("Job Card", job_card),
+			),
+			OperationsNotCompleteError,
+		)
+
+	def check_duplicate_entry_for_work_order(self):
+		"""Block another manufacture entry once existing entries already cover the work order qty plus allowance."""
+		if not self.wo_doc or self.wo_doc.track_semi_finished_goods:
+			return
+
+		other_entries = frappe.get_all(
+			"Stock Entry",
+			filters={
+				"work_order": self.doc.work_order,
+				"purpose": self.doc.purpose,
+				"docstatus": ["!=", 2],
+				"name": ["!=", self.doc.name],
+			},
+			pluck="name",
+		)
+		if not other_entries:
+			return
+
+		allowance_percentage = flt(
+			frappe.db.get_single_value("Manufacturing Settings", "overproduction_percentage_for_work_order")
+		)
+		allowed_qty = flt(self.wo_doc.qty) + (allowance_percentage / 100 * flt(self.wo_doc.qty))
+		if self.get_fg_qty_already_entered(other_entries) >= allowed_qty:
+			frappe.throw(
+				_("Stock Entries already created for Work Order {0}: {1}").format(
+					self.doc.work_order, ", ".join(other_entries)
+				),
+				DuplicateEntryForWorkOrderError,
+			)
+
+	def get_fg_qty_already_entered(self, other_entries):
+		child = frappe.qb.DocType("Stock Entry Detail")
+		qty = (
+			frappe.qb.from_(child)
+			.select(Sum(child.transfer_qty))
+			.where(
+				child.parent.isin(other_entries)
+				& (child.item_code == self.wo_doc.production_item)
+				& (child.s_warehouse.isnull() | (child.s_warehouse == ""))
+			)
+			.run()
+		)[0][0]
+		return flt(qty)
 
 	def add_items(self):
 		self.add_raw_materials()
@@ -553,10 +669,14 @@ class ManufactureStockEntry(BaseManufactureStockEntry):
 
 	def _append_transfer_based_rm(self, row, pending_qty_to_mfg):
 		item_args = self.get_item_dict(row)
+		if row.original_item:
+			item_args["original_item"] = row.original_item
 		is_return = self.doc.get("is_return")
 		qty = row.qty if is_return else (flt(row.qty) * flt(self.doc.fg_completed_qty)) / pending_qty_to_mfg
 		item_args["qty"] = ceil_qty_if_uom_has_whole_number(qty, row.uom)
 		item_args["transfer_qty"] = item_args["qty"]
+		if not flt(item_args["qty"], frappe.get_precision("Stock Entry Detail", "qty")):
+			return
 		if is_return:
 			item_args["s_warehouse"], item_args["t_warehouse"] = row.s_warehouse, row.t_warehouse
 		else:
@@ -641,13 +761,15 @@ class ManufactureStockEntry(BaseManufactureStockEntry):
 				& (stock_entry.purpose == "Material Transfer for Manufacture")
 				& (stock_entry.docstatus == 1)
 			)
+			.orderby(stock_entry.creation)
+			.orderby(stock_entry.name)
 			.orderby(stock_entry_detail.idx)
 		).run(as_dict=1)
 
 	def add_materials_from_transfer(self):
 		for row in self._transfer_entries:
 			row.warehouse = row.t_warehouse
-			key = (row.item_code, row.warehouse)
+			key = (row.item_code, row.warehouse, row.original_item or None)
 			if key not in self.available_materials:
 				self.available_materials[key] = frappe._dict(row)
 			else:
@@ -677,20 +799,61 @@ class ManufactureStockEntry(BaseManufactureStockEntry):
 	def remove_consumed_materials_from_available(self):
 		for row in self._consumption_entries:
 			row.warehouse = row.s_warehouse
-			key = (row.item_code, row.warehouse)
-			self.available_materials[key].qty -= row.qty
+			buckets = self._get_available_buckets(row)
 			if row.serial_and_batch_bundle:
-				self._deduct_consumed_serial_batch(key, row.serial_and_batch_bundle)
+				self._deduct_consumed_serial_batch(buckets, row.serial_and_batch_bundle)
+			else:
+				self._deduct_consumed_qty(buckets, flt(row.qty))
 
-	def _deduct_consumed_serial_batch(self, key, sabb_name):
+	def _get_available_buckets(self, row):
+		"""Use exact attribution when present; otherwise drain the direct item first."""
+		key = (row.item_code, row.warehouse, row.original_item or None)
+		if row.original_item and key in self.available_materials:
+			return [self.available_materials[key]]
+
+		buckets = [self.available_materials[key]] if key in self.available_materials else []
+		buckets.extend(
+			bucket
+			for material_key, bucket in self.available_materials.items()
+			if material_key[:2] == key[:2] and material_key != key
+		)
+		return buckets
+
+	def _deduct_consumed_qty(self, buckets, consumed_qty):
+		for bucket in buckets[:-1]:
+			deducted = min(max(flt(bucket.qty), 0.0), consumed_qty)
+			bucket.qty -= deducted
+			consumed_qty -= deducted
+		buckets[-1].qty -= consumed_qty
+
+	def _deduct_consumed_serial_batch(self, buckets, sabb_name):
 		_details = self.get_sabb_details(sabb_name)
 		if _details.serial_nos:
-			for sn in _details.serial_nos:
-				self.available_materials[key].serial_nos.remove(sn)
+			self._deduct_consumed_serial_nos(buckets, _details.serial_nos)
 		elif _details.batches:
 			for batch_no, qty in _details.batches.items():
-				# qty is negative, so add instead of subtract
-				self.available_materials[key].batches[batch_no] += qty
+				self._deduct_consumed_batch_qty(buckets, batch_no, -qty)
+
+	def _deduct_consumed_serial_nos(self, buckets, serial_nos):
+		for serial_no in serial_nos:
+			bucket = next(
+				(bucket for bucket in buckets if bucket.serial_nos and serial_no in bucket.serial_nos),
+				buckets[-1],
+			)
+			bucket.serial_nos.remove(serial_no)
+			bucket.qty -= 1
+
+	def _deduct_consumed_batch_qty(self, buckets, batch_no, consumed_qty):
+		holders = [bucket for bucket in buckets if bucket.batches and batch_no in bucket.batches]
+		if not holders:
+			holders = buckets[-1:]
+		for bucket in holders[:-1]:
+			deducted = min(max(flt(bucket.batches[batch_no]), 0.0), consumed_qty)
+			bucket.batches[batch_no] -= deducted
+			bucket.qty -= deducted
+			consumed_qty -= deducted
+		holders[-1].batches[batch_no] -= consumed_qty
+		holders[-1].qty -= consumed_qty
 
 	def add_additional_cost(self):
 		if not self.wo_doc:
@@ -704,6 +867,9 @@ class ManufactureStockEntry(BaseManufactureStockEntry):
 
 		secondary_items = self.get_secondary_items_from_job_card()
 		for row in secondary_items:
+			if row.stock_qty <= 0:
+				continue
+
 			row.uom = row.uom or row.stock_uom
 			row.qty = ceil_qty_if_uom_has_whole_number(row.stock_qty, row.stock_uom)
 			row.transfer_qty = row.qty
@@ -730,33 +896,38 @@ class ManufactureStockEntry(BaseManufactureStockEntry):
 
 	def _adjust_secondary_item_qtys(self, secondary_items, used_secondary_items, pending_qty):
 		for row in secondary_items:
-			row.stock_qty -= flt(used_secondary_items.get(row.item_code))
+			key = (row.item_code, row.secondary_item_type or "")
+			row.stock_qty -= flt(used_secondary_items.get(key))
 			row.stock_qty = row.stock_qty * flt(self.doc.fg_completed_qty) / flt(pending_qty)
-			if used_secondary_items.get(row.item_code):
-				used_secondary_items[row.item_code] -= row.stock_qty
 
 	def get_used_secondary_items(self):
 		data = self._query_used_secondary_items()
 		used_secondary_items = defaultdict(float)
 		for row in data:
-			used_secondary_items[row.item_code] += row.qty
+			secondary_item_type = row.secondary_item_type or ("Scrap" if row.is_legacy_scrap_item else "")
+			key = (row.item_code, secondary_item_type)
+			used_secondary_items[key] += row.qty
 		return used_secondary_items
 
 	def _query_used_secondary_items(self):
 		se = frappe.qb.DocType("Stock Entry")
 		sed = frappe.qb.DocType("Stock Entry Detail")
-		return (
+		query = (
 			frappe.qb.from_(se)
 			.inner_join(sed)
 			.on(sed.parent == se.name)
-			.select(sed.item_code, sed.qty)
+			.select(sed.item_code, sed.secondary_item_type, sed.is_legacy_scrap_item, sed.qty)
 			.where(
 				(se.work_order == self.doc.work_order)
 				& ((sed.secondary_item_type.isnotnull()) | (sed.is_legacy_scrap_item == 1))
 				& (se.docstatus == 1)
 				& (se.purpose.isin(["Repack", "Manufacture"]))
 			)
-		).run(as_dict=1)
+		)
+		if self.doc.job_card:
+			query = query.where(se.job_card == self.doc.job_card)
+
+		return query.run(as_dict=1)
 
 	def get_completed_job_card_qty(self):
 		return flt(min([d.completed_qty for d in self.wo_doc.operations]))
@@ -812,9 +983,97 @@ class RepackStockEntry(BaseManufactureStockEntry):
 	def before_validate(self):
 		self.set_default_warehouse()
 
+	def before_submit(self):
+		from .batch_split import BatchSplitFinishedGood
+
+		BatchSplitFinishedGood(self.doc).process()
+
 	def validate(self):
 		self.validate_raw_materials_exists()
 		self.validate_repack_entry()
+
+	def validate_fg_conversion(self):
+		if not self.doc.is_fg_conversion:
+			return
+
+		if not frappe.db.get_single_value("Manufacturing Settings", "allow_alternative_finished_goods"):
+			frappe.throw(
+				_(
+					"Enable 'Allow Alternative Finished Goods' in Manufacturing Settings to make a finished good conversion entry."
+				)
+			)
+
+		if not self.wo_doc:
+			frappe.throw(_("Work Order is mandatory for a finished good conversion entry."))
+
+		self._validate_work_order()
+		self.validate_alternative_finished_goods()
+		self.validate_conversion_qty()
+
+	def validate_alternative_finished_goods(self):
+		production_item = self.wo_doc.production_item
+		alternative_items = get_alternative_finished_goods(production_item)
+		if not alternative_items:
+			frappe.throw(
+				_(
+					"Please create Item Alternative records for the item {0} to change the finished item."
+				).format(get_link_to_form("Item", production_item))
+			)
+
+		for row in self.doc.items:
+			if row.is_finished_item and row.item_code not in alternative_items:
+				frappe.throw(
+					_("Row #{0}: Item {1} is not an alternative item of the production item {2}.").format(
+						row.idx, bold(row.item_code), bold(production_item)
+					)
+				)
+
+	def validate_conversion_qty(self):
+		production_item = self.wo_doc.production_item
+		consumed_qty = sum(
+			flt(row.transfer_qty)
+			for row in self.doc.items
+			if row.s_warehouse and row.item_code == production_item
+		)
+
+		if not consumed_qty:
+			frappe.throw(
+				_(
+					"A finished good conversion entry must consume the production item {0} of the Work Order {1}."
+				).format(bold(production_item), get_link_to_form("Work Order", self.doc.work_order))
+			)
+
+		self.validate_conversion_output_qty(consumed_qty, production_item)
+
+		is_submitting = self.doc.docstatus == 1
+		produced_qty = flt(
+			frappe.db.get_value("Work Order", self.doc.work_order, "produced_qty", for_update=is_submitting)
+		)
+		available_qty = produced_qty - get_converted_fg_qty(
+			self.doc.work_order, exclude=self.doc.name, for_update=is_submitting
+		)
+		if consumed_qty > available_qty:
+			frappe.throw(
+				_(
+					"The qty {0} of the item {1} to convert cannot be more than the available produced qty {2} against the Work Order {3}."
+				).format(
+					consumed_qty,
+					bold(production_item),
+					available_qty,
+					get_link_to_form("Work Order", self.doc.work_order),
+				)
+			)
+
+	def validate_conversion_output_qty(self, consumed_qty, production_item):
+		precision = self.doc.precision("fg_completed_qty")
+		output_qty = sum(flt(row.transfer_qty) for row in self.doc.items if row.is_finished_item)
+
+		if flt(output_qty, precision) != flt(consumed_qty, precision):
+			frappe.throw(
+				_(
+					"The total qty {0} of the alternative finished goods must be equal to the converted qty {1} of the production item {2}."
+				).format(output_qty, consumed_qty, bold(production_item))
+			)
 
 	def validate_repack_entry(self):
 		fg_items = {row.item_code: row for row in self.doc.items if row.is_finished_item}
@@ -852,6 +1111,8 @@ class MaterialConsumptionForManufactureStockEntry(ManufactureStockEntry):
 
 	def validate(self):
 		self.validate_work_order()
+		self.validate_manufactured_qty()
+		self.check_if_operations_completed()
 
 	def add_items(self):
 		if self.backflush_based_on == "BOM" or self.wo_doc.skip_transfer:
@@ -1361,3 +1622,44 @@ def _cap_sample_quantity(sample_quantity, max_retain_qty, retainted_qty, batch_n
 		)
 		return qty_diff
 	return sample_quantity
+
+
+def get_alternative_finished_goods(production_item):
+	alternatives = frappe.get_all(
+		"Item Alternative", filters={"item_code": production_item}, pluck="alternative_item_code"
+	)
+	alternatives += frappe.get_all(
+		"Item Alternative",
+		filters={"alternative_item_code": production_item, "two_way": 1},
+		pluck="item_code",
+	)
+	return list(dict.fromkeys(alternatives))
+
+
+def get_converted_fg_qty(work_order, exclude=None, for_update=False):
+	production_item = frappe.db.get_value("Work Order", work_order, "production_item")
+
+	se = frappe.qb.DocType("Stock Entry")
+	sed = frappe.qb.DocType("Stock Entry Detail")
+	query = (
+		frappe.qb.from_(se)
+		.inner_join(sed)
+		.on(sed.parent == se.name)
+		.select(sed.transfer_qty)
+		.where(
+			(se.work_order == work_order)
+			& (se.is_fg_conversion == 1)
+			& (se.docstatus == 1)
+			& (sed.item_code == production_item)
+			& sed.s_warehouse.notnull()
+			& (sed.s_warehouse != "")
+		)
+	)
+
+	if exclude:
+		query = query.where(se.name != exclude)
+
+	if for_update:
+		query = query.for_update()
+
+	return sum(flt(row[0]) for row in query.run())

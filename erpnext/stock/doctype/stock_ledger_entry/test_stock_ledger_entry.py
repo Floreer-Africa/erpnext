@@ -2,7 +2,7 @@
 # See license.txt
 
 import json
-import time
+from unittest.mock import patch
 from uuid import uuid4
 
 import frappe
@@ -1129,11 +1129,9 @@ class TestStockLedgerEntry(ERPNextTestSuite, StockTestMixin):
 		# original amount
 		self.assertEqual(50, _get_stock_credit(final_consumption))
 
+	@patch.dict(frappe.flags, {"dont_execute_stock_reposts": True})
 	def test_tie_breaking(self):
 		from erpnext.stock.doctype.repost_item_valuation.repost_item_valuation import repost_entries
-
-		frappe.flags.dont_execute_stock_reposts = True
-		self.addCleanup(frappe.flags.pop, "dont_execute_stock_reposts")
 
 		item = make_item().name
 		warehouse = "_Test Warehouse - _TC"
@@ -1237,8 +1235,6 @@ class TestStockLedgerEntry(ERPNextTestSuite, StockTestMixin):
 			posting_time="02:00:00",
 		)
 
-		time.sleep(3)
-
 		reciept2 = make_stock_entry(
 			item_code=item,
 			to_warehouse=warehouse,
@@ -1276,8 +1272,6 @@ class TestStockLedgerEntry(ERPNextTestSuite, StockTestMixin):
 			rate=10,
 			posting_time="02:00:00",
 		)
-
-		time.sleep(3)
 
 		# backdated entry with same timestamp but different ms part
 		reciept2 = make_stock_entry(
@@ -1323,7 +1317,6 @@ class TestStockLedgerEntry(ERPNextTestSuite, StockTestMixin):
 			posting_date="2021-01-01",
 			posting_time="02:00:00",
 		)
-		time.sleep(1)
 		receipt2 = make_purchase_receipt(
 			item_code=item,
 			warehouse=warehouse,
@@ -1391,8 +1384,6 @@ class TestStockLedgerEntry(ERPNextTestSuite, StockTestMixin):
 					posting_time=posting_time,
 				)
 			)
-			time.sleep(1)
-
 		dn = dns[2]
 		dn.cancel()
 
@@ -1572,6 +1563,32 @@ class TestStockLedgerEntry(ERPNextTestSuite, StockTestMixin):
 		make_stock_entry(
 			item_code=item_code, source=warehouse, qty=470.84, rate=100, posting_date=add_days(today(), -1)
 		)
+
+	def test_zero_qty_row_is_skipped(self):
+		"""A zero-qty non-reconciliation row must be skipped entirely: no SLE,
+		no crash, no reprocessing of the previous row's entry."""
+		from erpnext.stock.stock_ledger import make_sl_entries
+
+		item = make_item(properties={"is_stock_item": 1})
+		voucher_no = f"zero-qty-{uuid4()}"
+
+		make_sl_entries(
+			[
+				frappe._dict(
+					item_code=item.name,
+					warehouse="_Test Warehouse - _TC",
+					company="_Test Company",
+					posting_date=today(),
+					posting_time="12:00:00",
+					voucher_type="Stock Entry",
+					voucher_no=voucher_no,
+					actual_qty=0,
+					stock_uom=item.stock_uom,
+				)
+			]
+		)
+
+		self.assertFalse(frappe.db.exists("Stock Ledger Entry", {"voucher_no": voucher_no}))
 
 
 def create_repack_entry(**args):

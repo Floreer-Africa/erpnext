@@ -783,6 +783,7 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 				method: "process_item_selection",
 				args: {
 					item_idx: item.idx,
+					reset_item_details: true,
 				},
 				callback: function (r) {
 					if (!r.exc) {
@@ -798,7 +799,7 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 
 	process_item_selection(doc, cdt, cdn) {
 		var item = frappe.get_doc(cdt, cdn);
-		let update_stock = 0;
+		let update_stock = ["Sales Invoice", "Purchase Invoice"].includes(doc.doctype) ? doc.update_stock : 0;
 		var me = this;
 
 		item.weight_per_unit = 0;
@@ -1437,17 +1438,17 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 		) {
 			const to_clear = [];
 			if (doc.payment_terms_template) {
-				to_clear.push(__(frappe.meta.get_label(cdt, "payment_terms_template")));
+				to_clear.push(frappe.meta.get_translated_label(cdt, "payment_terms_template"));
 			}
 
 			if (doc.payment_schedule?.length) {
-				to_clear.push(__(frappe.meta.get_label(cdt, "payment_schedule")));
+				to_clear.push(frappe.meta.get_translated_label(cdt, "payment_schedule"));
 			}
 
 			frappe.confirm(
 				__(
 					"For the new {0} to take effect, would you like to clear the current {1}?",
-					[__(frappe.meta.get_label(cdt, "due_date")), frappe.utils.comma_and(to_clear)],
+					[frappe.meta.get_translated_label(cdt, "due_date"), frappe.utils.comma_and(to_clear)],
 					"Clear payment terms template and/or payment schedule when due date is changed"
 				),
 				() => {
@@ -1802,7 +1803,10 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 		let item = frappe.get_doc(cdt, cdn);
 		item.conversion_factor = 1.0;
 		if (item.stock_qty) {
-			item.conversion_factor = flt(item.stock_qty) / flt(item.qty);
+			item.conversion_factor = flt(
+				flt(item.stock_qty) / flt(item.qty),
+				precision("conversion_factor", item)
+			);
 		}
 
 		refresh_field("conversion_factor", item.name, item.parentfield);
@@ -2642,7 +2646,7 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 				if (!me.frm.doc[fieldname]) {
 					frappe.msgprint(
 						__("Please specify {0}. It is needed to fetch Item Details.", [
-							__(frappe.meta.get_label(me.frm.doc.doctype, fieldname, me.frm.doc.name)),
+							frappe.meta.get_translated_label(me.frm.doc.doctype, fieldname, me.frm.doc.name),
 						])
 					);
 					valid = false;
@@ -2884,8 +2888,10 @@ erpnext.TransactionController = class TransactionController extends erpnext.taxe
 			method: me.get_method_for_payment(),
 			args: args,
 			callback: function (r) {
-				var doclist = frappe.model.sync(r.message);
-				frappe.set_route("Form", doclist[0].doctype, doclist[0].name);
+				if (!r.exc) {
+					var doclist = frappe.model.sync(r.message);
+					frappe.set_route("Form", doclist[0].doctype, doclist[0].name);
+				}
 			},
 		});
 	}
