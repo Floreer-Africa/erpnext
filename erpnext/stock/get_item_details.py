@@ -75,6 +75,34 @@ def _preprocess_ctx(ctx):
 	set_transaction_type(ctx)
 
 
+def _caller_declared_permission_bypass(doc) -> bool:
+	"""Return True when the parent document we were handed has itself bypassed permissions.
+
+	PR-Foundry/framework#185 (fork marker). ``get_item_details`` re-checks the **Item**
+	against ``frappe.session.user``. On the internal path
+	(``accounts_controller.set_missing_item_details`` -> ``get_item_details(ctx, self, ...)``)
+	the parent document has usually already made that decision for itself, e.g. webshop's
+	cart does ``quotation.flags.ignore_permissions = True`` before ``quotation.save()``.
+	That flag governs the Quotation and cannot reach the Item, so a portal customer -- who
+	holds no read on Item, and never has upstream -- got ``PermissionError`` on every
+	add-to-cart and could not check out at all.
+
+	``frappe.model.document.Document.has_permission`` already honours this exact flag for the
+	document itself; every layer expresses the decision and only this one failed to pass it
+	on. Same shape as framework#124.
+
+	SECURITY: ``get_item_details`` is also ``@frappe.whitelist()``. Over the wire ``doc``
+	arrives as a JSON string and is only ``frappe.parse_json``-ed into a dict further down, so
+	a caller posting ``doc={"flags": {"ignore_permissions": 1}}`` must NOT be able to forge
+	this. Requiring a real ``Document`` instance is what makes that impossible --
+	``erpnext.normalize_ctx_input`` normalises only ``ctx``, never ``doc``. Do not relax this
+	to a ``.get("flags")`` lookup.
+	"""
+	from frappe.model.document import Document
+
+	return isinstance(doc, Document) and bool(doc.flags.ignore_permissions)
+
+
 @frappe.whitelist()
 @erpnext.normalize_ctx_input(ItemDetailsCtx)
 def get_item_details(
@@ -108,7 +136,8 @@ def get_item_details(
 	for_validate = parse_json(for_validate)
 	overwrite_warehouse = parse_json(overwrite_warehouse)
 	item = frappe.get_cached_doc("Item", ctx.item_code)
-	item.check_permission()
+	if not _caller_declared_permission_bypass(doc):
+		item.check_permission()
 	validate_item_details(ctx, item)
 
 	doc = frappe.parse_json(doc)
