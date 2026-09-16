@@ -104,9 +104,15 @@ def floreer_trusted_but_unprivileged(doc) -> bool:
 def floreer_system_authority():
 	"""Run a block with system authority, then restore the caller's session.
 
-	``set_user()`` clobbers ``sid`` and WIPES ``session.data`` — restoring the
-	user alone logs a live web customer out on their next request
-	(floreer_app#167), so all three are saved and put back.
+	``set_user()`` clobbers ``sid``, WIPES ``session.data`` and REPLACES
+	``local.form_dict`` — restoring the user alone logs a live web customer out on
+	their next request (floreer_app#167), so all four are saved and put back.
+
+	``form_dict`` is the REQUEST BODY (framework#226). Losing it blanks the request
+	for every reader downstream of this block in the same request: pos resolves the
+	calling till through ``pos.api.profile.request_device_id()``, which reads
+	``form_dict["device_id"]``, so an elevated validate left the kitchen board with
+	no ``till_label`` — Ruling D6's load-bearing field. Measured, not theorised.
 
 	Kept as narrow as possible on purpose: ``run_before_save_methods()`` completes
 	before ``db_insert()`` assigns ``owner = frappe.session.user``, so the customer
@@ -117,6 +123,7 @@ def floreer_system_authority():
 	prev_user = frappe.session.user
 	prev_sid = frappe.session.sid
 	prev_data = frappe.session.data
+	prev_form_dict = frappe.local.form_dict
 	try:
 		frappe.set_user("Administrator")
 		yield
@@ -124,6 +131,7 @@ def floreer_system_authority():
 		frappe.set_user(prev_user)
 		frappe.session.sid = prev_sid
 		frappe.session.data = prev_data
+		frappe.local.form_dict = prev_form_dict
 
 
 class AccountsController(TransactionBase):
