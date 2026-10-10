@@ -306,11 +306,85 @@ class PricingRule(Document):
 				self.same_item = 1
 
 	def validate_max_discount(self):
-		if self.rate_or_discount == "Discount Percentage" and self.get("items"):
-			for d in self.items:
-				max_discount = frappe.get_cached_value("Item", d.item_code, "max_discount")
-				if max_discount and flt(self.discount_percentage) > flt(max_discount):
-					throw(_("Max discount allowed for item: {0} is {1}%").format(d.item_code, max_discount))
+		"""Refuse a discount above the `max_discount` of any item this rule can price.
+
+		framework#239 — upstream checked `self.items` only, the `Pricing Rule Item Code`
+		table, while this doctype carries three row tables (`items`, `item_groups`,
+		`brands`) and `items` is populated only when `apply_on == "Item Code"`. So a rule
+		scoped to an Item Group or a Brand saved however far it exceeded the caps of the
+		items it would actually price, and the contradiction surfaced only at transaction
+		time as `Maximum discount for Item {0} is {1}%` from
+		`SellingController.validate_max_discount`. On the POS path that is a sale whose
+		money is already captured, dead-lettering with no invoice and no stock movement
+		(PR-Foundry/pos#697, where it was measured).
+
+		⚠️ This NARROWS the trap, it does not close it: only the items matching at save
+		time are visible here, so an item added to the group later, or one whose
+		`max_discount` is lowered afterwards, re-creates the contradiction with no save to
+		catch it. pos#697(a) removes the consequence; this removes one route to the cause.
+		"""
+		if self.rate_or_discount != "Discount Percentage":
+			return
+
+		pct = flt(self.discount_percentage)
+		for d in self.get("items") or []:
+			max_discount = frappe.get_cached_value("Item", d.item_code, "max_discount")
+			if max_discount and pct > flt(max_discount):
+				throw(_("Max discount allowed for item: {0} is {1}%").format(d.item_code, max_discount))
+
+		for fieldname, link_field in (("item_groups", "item_group"), ("brands", "brand")):
+			values = [r.get(link_field) for r in (self.get(fieldname) or []) if r.get(link_field)]
+			if not values:
+				continue
+			if link_field == "item_group":
+				# Item Group is a NESTED SET: a rule on a parent prices every descendant,
+				# so the members must be resolved through lft/rgt. Comparing group NAMES
+				# would let a rule on "All Item Groups" through while it caps nothing.
+				values = self._item_group_descendants(values)
+			offender = self._lowest_capped_item_below(link_field, values, pct)
+			if offender:
+				throw(
+					_("Max discount allowed for item: {0} is {1}%").format(
+						offender.item_code, offender.max_discount
+					)
+				)
+
+	@staticmethod
+	def _item_group_descendants(groups):
+		"""Every Item Group at or beneath `groups`, via the nested set."""
+		names = set(groups)
+		for group in groups:
+			bounds = frappe.db.get_value("Item Group", group, ["lft", "rgt"], as_dict=True)
+			if not bounds:
+				continue
+			names.update(
+				frappe.get_all(
+					"Item Group",
+					filters={"lft": [">=", bounds.lft], "rgt": ["<=", bounds.rgt]},
+					pluck="name",
+				)
+			)
+		return list(names)
+
+	@staticmethod
+	def _lowest_capped_item_below(link_field, values, pct):
+		"""The most-restricted item this rule would breach, or None.
+
+		ONE query per table rather than one per item: a rule on a broad group can match
+		thousands of items and this runs on every save of every Pricing Rule. `> 0` is
+		load-bearing — `max_discount = 0` means NO cap in ERPNext, and treating it as a
+		cap would refuse every rule on an ordinary item.
+		"""
+		rows = frappe.get_all(
+			"Item",
+			filters={link_field: ["in", values], "max_discount": [">", 0]},
+			fields=["item_code", "max_discount"],
+			order_by="max_discount asc",
+			limit=1,
+		)
+		if rows and pct > flt(rows[0].max_discount):
+			return rows[0]
+		return None
 
 	def validate_price_list_with_currency(self):
 		if self.currency and self.for_price_list:

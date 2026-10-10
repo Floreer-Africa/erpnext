@@ -2,6 +2,8 @@
 # License: GNU General Public License v3. See license.txt
 
 
+import json
+
 import frappe
 from frappe import _, bold, throw
 from frappe.query_builder.functions import Sum
@@ -14,6 +16,23 @@ from erpnext.controllers.stock_controller import StockController
 from erpnext.stock.doctype.item.item import set_item_default
 from erpnext.stock.get_item_details import get_bin_details, get_conversion_factor
 from erpnext.stock.utils import get_combine_datetime, get_incoming_rate, get_valuation_method
+
+
+def _applied_pricing_rule_label(row):
+	"""The Pricing Rule(s) stamped on a transaction row, as a readable label.
+
+	framework#239. `pricing_rules` is a JSON list written by the pricing engine; it is
+	absent when a discount was typed by hand. Returns "" rather than raising on anything
+	unparseable — a validation message must never be the thing that breaks the save.
+	"""
+	raw = row.get("pricing_rules")
+	if not raw:
+		return ""
+	try:
+		names = json.loads(raw) if isinstance(raw, str) else list(raw)
+	except (ValueError, TypeError):
+		return ""
+	return ", ".join(str(n) for n in names if n)
 
 
 class SellingController(StockController):
@@ -269,6 +288,19 @@ class SellingController(StockController):
 				discount = flt(frappe.get_cached_value("Item", d.item_code, "max_discount"))
 
 				if discount and flt(d.discount_percentage) > discount:
+					# framework#239 — name the Pricing Rule that applied the discount.
+					# The bare message states a fact about the ITEM and nothing about what
+					# actually set the rate, so an operator is told a cap exists with no
+					# thread back to the thing to edit. When a rule is responsible the row
+					# already records it in `pricing_rules`; when the discount was typed by
+					# hand there is none, and the message is unchanged.
+					rule = _applied_pricing_rule_label(d)
+					if rule:
+						frappe.throw(
+							_("Maximum discount for Item {0} is {1}% (applied by Pricing Rule {2})").format(
+								d.item_code, discount, rule
+							)
+						)
 					frappe.throw(_("Maximum discount for Item {0} is {1}%").format(d.item_code, discount))
 
 	def set_qty_as_per_stock_uom(self):
