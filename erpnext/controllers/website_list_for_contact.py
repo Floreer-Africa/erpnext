@@ -90,7 +90,16 @@ def get_transaction_list(
 		# find party for this contact
 		customers, suppliers = get_customers_suppliers(parties_doctype, user)
 
-		if customers:
+		if customers and suppliers:
+			# Floreer (framework#271): a contact linked to BOTH a Customer and a
+			# Supplier sees documents where EITHER party matches. Purchase Order has
+			# a `customer` field (drop-ship) as well as `supplier`; upstream took the
+			# customer branch below and filtered `customer IN (...)`, so a supplier
+			# PO (empty customer) never listed. List sibling of framework#146.
+			filters = either_party_filters(doctype, filters, customers, suppliers)
+			if filters is None:
+				return []
+		elif customers:
 			if doctype == "Quotation":
 				filters["quotation_to"] = "Customer"
 				filters["party_name"] = ["in", customers]
@@ -127,6 +136,34 @@ def get_transaction_list(
 		return transactions
 
 	return post_process(doctype, transactions)
+
+
+def either_party_filters(doctype, filters, customers, suppliers):
+	"""Return `filters` as a list, restricted to documents where the customer OR
+	the supplier is one of the contact's parties (framework#271).
+
+	Not expressed as `or_filters`: frappe.www.list.get_list ORs its search-text
+	conditions into the same `or_filters`, which would widen the result past the
+	party restriction. Not a `name` key in the dict either: get_list overwrites
+	`filters["name"]` for search text on a doctype without search_fields. A list
+	of AND-ed conditions survives both, and pagination stays in get_list.
+	"""
+	names = frappe.get_all(
+		doctype,
+		or_filters={get_customer_field_name(doctype): ["in", customers], "supplier": ["in", suppliers]},
+		pluck="name",
+		limit=0,
+	)
+	if not names:
+		return None
+
+	conditions = [[doctype, "name", "in", names]]
+	for fieldname, value in filters.items():
+		if isinstance(value, list | tuple) and len(value) == 2:
+			conditions.append([doctype, fieldname, value[0], value[1]])
+		else:
+			conditions.append([doctype, fieldname, "=", value])
+	return conditions
 
 
 def get_list_for_transactions(
