@@ -77,7 +77,7 @@
 		<div class="row grand-total-row">
 			<div class="col-9 text-right">{{ _("Grand Total") }}</div>
 			<div class="col-3 text-right">
-			{{doc.currency_symbol}}  <span class="tax-grand-total">0.0</span>
+			{{doc.currency_symbol}}  <span class="tax-grand-total">{{ doc.floreer_prev_grand_total_display or "0.0" }}</span>
 			</div>
 		</div>
         {% endif %}

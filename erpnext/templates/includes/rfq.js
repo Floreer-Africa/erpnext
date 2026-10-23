@@ -1,7 +1,9 @@
 // Copyright (c) 2015, Frappe Technologies Pvt. Ltd. and Contributors
 // License: GNU General Public License v3. See license.txt
 
-window.doc={{ doc.as_json() }};
+// Floreer (floreer_app#358): rfq_doc_json carries each line's prefilled
+// previous rate + amount, so an untouched rate box still submits its price.
+window.doc={{ rfq_doc_json or doc.as_json() }};
 
 $(document).ready(function() {
 	new rfq();

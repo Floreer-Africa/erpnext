@@ -35,12 +35,18 @@
 				font-weight: 600;
 				color: #1c1b18;
 			"
-			value="0.00"
+			value="{{ d.floreer_prev_rate_display or '0.00' }}"
 			placeholder="{{ _('Enter rate') }}"
 			data-idx="{{ d.idx }}">
+			{%- if d.floreer_prev_rate_display %}
+			{#- Floreer (floreer_app#358): the supplier's previous price for this item. #}
+			<p class="text-muted small rfq-prev-rate" style="margin-top: 10px;">
+				{{ _("Last: {0}").format((doc.currency_symbol or "") ~ " " ~ d.floreer_prev_rate_hint) }}
+			</p>
+			{%- endif %}
 		</div>
         <div class="col-sm-3 col-4 text-right" style="padding-top: 9px;">
-           {{doc.currency_symbol}} <span class="rfq-amount" data-idx="{{ d.idx }}">0.00</span>
+           {{doc.currency_symbol}} <span class="rfq-amount" data-idx="{{ d.idx }}">{{ d.floreer_prev_amount_display or '0.00' }}</span>
         </div>
 		</div>
 	</div>
