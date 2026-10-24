@@ -2,11 +2,12 @@ from collections import defaultdict
 
 import frappe
 from frappe import _
-from frappe.query_builder.functions import Min, NullIf, Sum
+from frappe.query_builder.functions import IfNull, Min, NullIf, Sum
 from frappe.utils import flt
 
 from erpnext.stock.doctype.serial_no.serial_no import get_serial_nos
 from erpnext.stock.serial_batch_bundle import SerialBatchCreation
+from erpnext.stock.serial_batch_identity import SerialBatchIdentity
 from erpnext.stock.utils import get_combine_datetime
 
 from .manufacturing import (
@@ -22,6 +23,10 @@ def _qty_tolerance(precision: int) -> float:
 	"""One unit at the column's precision -- absorbs float rounding without letting a real
 	(whole-unit) quantity divergence slip through."""
 	return 1.0 / (10**precision)
+
+
+def _manufacture_line_order(line):
+	return (line.parent_creation, line.parent_name.casefold(), line.parent_name, line.idx)
 
 
 class DisassembleStockEntry(BaseStockEntry):
@@ -80,9 +85,7 @@ class DisassembleStockEntry(BaseStockEntry):
 		"""Every non-finished-good row's posted stock qty must equal the source qty x scale."""
 		scale_factor = self._get_disassembly_scale_factor()
 		if not scale_factor:
-			# Standalone BOM disassembly: no source entry to scale against. The finished-good
-			# invariant above still applies; raw-material amounts come from the BOM.
-			return
+			return self.validate_materials_against_bom()
 
 		source_rows = self.get_items_from_manufacture_stock_entry()
 		source_by_name = {row.name: row for row in source_rows if row.get("name")}
@@ -124,6 +127,40 @@ class DisassembleStockEntry(BaseStockEntry):
 					),
 					title=_("Invalid Disassembly Quantity"),
 				)
+
+	def validate_materials_against_bom(self):
+		if not self.doc.bom_no:
+			return
+
+		expected_qty = {
+			row.item_code: flt(row.qty) * flt(self.doc.fg_completed_qty)
+			for row in get_bom_items(self.doc.bom_no, self.doc.use_multi_level_bom)
+		}
+		precision = frappe.get_precision("Stock Entry Detail", "transfer_qty")
+		for item_code, qty in self.get_received_component_qty().items():
+			if item_code not in expected_qty:
+				frappe.throw(
+					_("Item {0} is not part of the BOM {1} and cannot be added to this disassembly.").format(
+						frappe.bold(item_code), frappe.bold(self.doc.bom_no)
+					),
+					title=_("Invalid Disassembly Item"),
+				)
+
+			if abs(flt(qty, precision) - flt(expected_qty[item_code], precision)) > _qty_tolerance(precision):
+				frappe.throw(
+					_("Item {0} quantity ({1} in stock UOM) does not match the BOM quantity {2}.").format(
+						frappe.bold(item_code), flt(qty, precision), flt(expected_qty[item_code], precision)
+					),
+					title=_("Invalid Disassembly Quantity"),
+				)
+
+	def get_received_component_qty(self) -> dict:
+		received_qty = defaultdict(float)
+		for row in self.doc.items:
+			if row.t_warehouse and not row.is_finished_item:
+				received_qty[row.item_code] += flt(row.transfer_qty)
+
+		return received_qty
 
 	def _get_disassembly_scale_factor(self) -> float:
 		disassemble_qty = flt(self.doc.fg_completed_qty)
@@ -230,7 +267,7 @@ class DisassembleStockEntry(BaseStockEntry):
 			"t_warehouse": t_warehouse,
 			"is_finished_item": source_row.is_finished_item,
 			"secondary_item_type": source_row.secondary_item_type,
-			"is_legacy_scrap_item": source_row.is_legacy_scrap_item,
+			"valuation_type": source_row.valuation_type,
 			"bom_secondary_item": source_row.bom_secondary_item,
 			"bom_no": source_row.bom_no,
 			"use_serial_batch_fields": 1 if (source_row.batch_no or source_row.serial_no) else 0,
@@ -284,7 +321,7 @@ class DisassembleStockEntry(BaseStockEntry):
 			for field in fields:
 				item_args[field] = row.get(field)
 
-			item_args["is_legacy_scrap_item"] = row.get("is_legacy")
+			item_args["valuation_type"] = row.get("valuation_type")
 			item_args["s_warehouse"] = self.doc.from_warehouse
 			item_args["uom"] = item_args.get("uom") or item_args.get("stock_uom")
 			item_args["bom_secondary_item"] = row.get("name")
@@ -330,7 +367,7 @@ class DisassembleStockEntry(BaseStockEntry):
 			SED.conversion_factor,
 			SED.is_finished_item,
 			SED.secondary_item_type,
-			SED.is_legacy_scrap_item,
+			SED.valuation_type,
 			SED.bom_secondary_item,
 			SED.batch_no,
 			SED.serial_no,
@@ -382,6 +419,10 @@ class DisassembleStockEntry(BaseStockEntry):
 		is_finished_item decides whether the row is the output or an input. Aggregating each column
 		on its own can pair values from different lines into a row that was never posted, so take
 		the columns from a single real line instead. UOM is normalized separately to stock UOM.
+
+		Ordered in Python rather than SQL, keeping the original (entry creation, entry name, line idx)
+		precedence. casefold reproduces MariaDB's case-insensitive collation without depending on the
+		database's, which PostgreSQL resolves by byte value.
 		"""
 		SE = frappe.qb.DocType("Stock Entry")
 		SED = frappe.qb.DocType("Stock Entry Detail")
@@ -391,13 +432,16 @@ class DisassembleStockEntry(BaseStockEntry):
 			.join(SE)
 			.on(SED.parent == SE.name)
 			.select(
+				SE.creation.as_("parent_creation"),
+				SE.name.as_("parent_name"),
+				SED.idx,
 				SED.item_code,
 				SED.item_name,
 				SED.description,
 				SED.stock_uom,
 				SED.is_finished_item,
 				SED.secondary_item_type,
-				SED.is_legacy_scrap_item,
+				SED.valuation_type,
 				SED.bom_secondary_item,
 				SED.batch_no,
 				SED.serial_no,
@@ -409,20 +453,22 @@ class DisassembleStockEntry(BaseStockEntry):
 			.where(
 				(SE.docstatus == 1) & (SE.purpose == "Manufacture") & (SE.work_order == self.doc.work_order)
 			)
-			.orderby(SE.creation)
-			.orderby(SE.name)
-			.orderby(SED.idx)
 			.run(as_dict=True)
 		)
+		lines.sort(key=_manufacture_line_order)
 
 		representative = {}
 		for line in lines:
+			line.pop("parent_creation")
+			line.pop("parent_name")
 			representative.setdefault(line.item_code, line)
 
 		return representative
 
-	def on_submit(self):
+	def before_submit(self):
 		self.set_serial_batch_for_disassembly()
+
+	def on_submit(self):
 		self.update_disassembled_order()
 
 	def on_cancel(self):
@@ -481,7 +527,11 @@ class DisassembleStockEntry(BaseStockEntry):
 		if source_bundle.get("serial_nos"):
 			return get_serial_nos(source_bundle["serial_nos"])[: int(row.transfer_qty)]
 		elif source_row.serial_no:
-			return get_serial_nos(source_row.serial_no)[: int(row.transfer_qty)]
+			return SerialBatchIdentity("Serial No").resolve(
+				source_row.item_code,
+				get_serial_nos(source_row.serial_no)[: int(row.transfer_qty)],
+				ignore_permissions=True,
+			)
 		return []
 
 	def _set_serial_batch_for_disassembly_from_available_materials(self):
@@ -553,7 +603,15 @@ def get_available_materials(work_order, stock_entry_doc=None) -> dict:
 				{"item_details": row, "batch_details": defaultdict(float), "qty": 0, "serial_nos": []}
 			)
 		_update_material_qty(available_materials[key], row, stock_entry_doc)
+	sort_serial_nos_by_number(available_materials)
 	return available_materials
+
+
+def sort_serial_nos_by_number(available_materials):
+	serial_nos = [serial_no for material in available_materials.values() for serial_no in material.serial_nos]
+	numbers = SerialBatchIdentity("Serial No").get_number_map(serial_nos)
+	for material in available_materials.values():
+		material.serial_nos.sort(key=lambda name: numbers.get(name, name))
 
 
 def _get_material_key(row, stock_entry_doc):
@@ -585,10 +643,8 @@ def _add_inward_material_qty(item_data, row):
 
 
 def _extend_serial_nos_from_row(item_data, row):
-	sn = row.serial_no or row.serial_nos
-	if sn:
-		item_data.serial_nos.extend(get_serial_nos(sn))
-		item_data.serial_nos.sort()
+	known = set(item_data.serial_nos)
+	item_data.serial_nos.extend(serial_no for serial_no in row.serial_nos or [] if serial_no not in known)
 
 
 def _deduct_consumed_material_qty(item_data, row):
@@ -602,10 +658,7 @@ def _deduct_consumed_material_qty(item_data, row):
 
 
 def _remove_serial_nos_from_available(item_data, row):
-	sn = row.serial_no or row.serial_nos
-	if not sn:
-		return
-	for serial_no in get_serial_nos(sn):
+	for serial_no in row.serial_nos or []:
 		if serial_no in item_data.serial_nos:
 			item_data.serial_nos.remove(serial_no)
 
@@ -615,6 +668,11 @@ def get_stock_entry_data(work_order, stock_entry_doc=None):
 	if not data:
 		return []
 	_enrich_with_bundle_data(data, stock_entry_doc)
+	for row in data:
+		if row.serial_no and not row.serial_nos:
+			row.serial_nos = SerialBatchIdentity("Serial No").resolve(
+				row.item_code, get_serial_nos(row.serial_no), ignore_permissions=True
+			)
 	return data
 
 
@@ -661,7 +719,7 @@ def _apply_stock_entry_purpose_filter(query, se, sed, stock_entry_doc):
 			["Manufacture", "Material Consumption for Manufacture", "Material Transfer for Manufacture"]
 		)
 	)
-	return query.where(sed.s_warehouse.isnotnull())
+	return query.where(IfNull(sed.s_warehouse, "") != "")
 
 
 def _enrich_with_bundle_data(data, stock_entry_doc):

@@ -159,7 +159,7 @@ frappe.ui.form.on("Customer", {
 		if (frappe.defaults.get_default("cust_master_name") != "Naming Series") {
 			frm.toggle_display("naming_series", false);
 		} else {
-			erpnext.toggle_naming_series();
+			erpnext.toggle_naming_series(frm);
 		}
 
 		if (!frm.doc.__islocal) {
@@ -217,8 +217,14 @@ frappe.ui.form.on("Customer", {
 				);
 			}
 
-			// indicator
-			erpnext.utils.set_party_dashboard_indicators(frm);
+			const loyalty = (frm.doc.__onload?.dashboard_info || []).filter((d) => d.loyalty_points);
+			loyalty.forEach((info) => {
+				const label =
+					loyalty.length > 1
+						? __("Loyalty Points ({0}): {1}", [info.company, info.loyalty_points])
+						: __("Loyalty Points: {0}", [info.loyalty_points]);
+				frm.dashboard.add_indicator(label, "blue");
+			});
 		} else {
 			frappe.contacts.clear_address_and_contact(frm);
 		}

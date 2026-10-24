@@ -28,6 +28,7 @@ from erpnext.controllers.website_list_for_contact import (
 	add_role_for_portal_user,
 	link_portal_users_to_contacts,
 )
+from erpnext.stock.doctype.price_list.price_list import validate_default_price_list_side
 from erpnext.utilities.transaction_base import TransactionBase
 
 from .mapper import (
@@ -92,11 +93,13 @@ class Customer(TransactionBase):
 		market_segment: DF.Link | None
 		mobile_no: DF.ReadOnly | None
 		naming_series: DF.Literal["CUST-.YYYY.-"]
+		on_hold: DF.Check
 		opportunity_name: DF.Link | None
 		payment_terms: DF.Link | None
 		portal_users: DF.Table[PortalUser]
 		primary_address: DF.TextEditor | None
 		prospect_name: DF.Link | None
+		release_date: DF.Date | None
 		represents_company: DF.Link | None
 		restrict_to_companies: DF.Check
 		sales_team: DF.Table[SalesTeam]
@@ -118,6 +121,10 @@ class Customer(TransactionBase):
 	def load_dashboard_info(self):
 		info = get_dashboard_info(self.doctype, self.name, self.loyalty_program)
 		self.set_onload("dashboard_info", info)
+
+	def before_save(self):
+		if not self.on_hold:
+			self.release_date = None
 
 	def autoname(self):
 		cust_master_name = frappe.defaults.get_global_default("cust_master_name")
@@ -184,14 +191,17 @@ class Customer(TransactionBase):
 		self.flags.is_new_doc = self.is_new()
 		self.flags.old_lead = self.lead_name
 		self.validate_customer_group()
+		self.validate_lead_not_converted()
 		validate_party_accounts(self)
 		self.validate_credit_limit_on_change()
 		self.set_loyalty_program()
 		self.check_customer_group_change()
 		self.validate_default_bank_account()
 		self.validate_internal_customer()
+		self.validate_prospect_not_converted()
 		self.add_role_for_user()
 		self.validate_currency_for_receivable_payable_and_advance_account()
+		validate_default_price_list_side(self.default_price_list, "selling")
 
 		# set loyalty program tier
 		if not self.is_new() and (customer := self.get_doc_before_save()):
@@ -202,6 +212,18 @@ class Customer(TransactionBase):
 			total = sum(flt(member.allocated_percentage) for member in self.sales_team)
 			if flt(total, self.precision("allocated_percentage", "sales_team")) != 100:
 				frappe.throw(_("Total contribution percentage should be equal to 100"))
+
+	def validate_lead_not_converted(self):
+		if not (self.is_new() and self.lead_name):
+			return
+
+		if customer := frappe.db.exists("Customer", {"lead_name": self.lead_name}):
+			frappe.throw(
+				_("Lead {0} is already converted to Customer {1}").format(
+					frappe.bold(self.lead_name), get_link_to_form("Customer", customer)
+				),
+				frappe.DuplicateEntryError,
+			)
 
 	@frappe.whitelist(methods=["POST"])
 	def get_customer_group_details(self):
@@ -305,7 +327,7 @@ class Customer(TransactionBase):
 			)
 
 	def create_primary_contact(self):
-		if not self.customer_primary_contact and not self.lead_name:
+		if not self.customer_primary_contact and not self.lead_has_contact():
 			if self.mobile_no or self.email_id or self.first_name or self.last_name:
 				contact = make_contact(self)
 				self.db_set("customer_primary_contact", contact.name)
@@ -320,6 +342,15 @@ class Customer(TransactionBase):
 			# validation needed). Upstream-owned — re-verify after any erpnext sync.
 			# Guarded by client_app.tests.test_customer_primary_ensure_permissionless.
 			frappe.db.set_value("Contact", self.customer_primary_contact, "is_primary_contact", 1)  # ensure
+
+	def lead_has_contact(self) -> bool:
+		"""The lead's contacts are linked to the customer instead of making a new one."""
+		return bool(
+			self.lead_name
+			and frappe.db.exists(
+				"Dynamic Link", {"parenttype": "Contact", "link_doctype": "Lead", "link_name": self.lead_name}
+			)
+		)
 
 	def create_primary_address(self):
 		from frappe.contacts.doctype.address.address import render_address
@@ -345,8 +376,29 @@ class Customer(TransactionBase):
 	def update_lead_status(self):
 		"""If Customer created from Lead, update lead status to "Converted"
 		update Customer link in Quotation, Opportunity"""
-		if self.lead_name:
-			frappe.db.set_value("Lead", self.lead_name, "status", "Converted")
+		if not self.lead_name:
+			return
+
+		lead = frappe.get_doc("Lead", self.lead_name)
+		lead.db_set("status", "Converted")
+		lead.update_prospect()
+		for doctype, party_type_field in (("Quotation", "quotation_to"), ("Opportunity", "opportunity_from")):
+			self.link_lead_records(doctype, party_type_field)
+
+	def link_lead_records(self, doctype: str, party_type_field: str):
+		names = [
+			name
+			for name in frappe.get_all(
+				doctype, {party_type_field: "Lead", "party_name": self.lead_name}, pluck="name"
+			)
+			if frappe.has_permission(doctype, "write", name)
+		]
+		if names:
+			frappe.db.set_value(
+				doctype,
+				{"name": ("in", names), party_type_field: "Lead", "party_name": self.lead_name},
+				{party_type_field: "Customer", "party_name": self.name},
+			)
 
 	def link_address_and_contact(self):
 		linked_documents = {
@@ -383,8 +435,8 @@ class Customer(TransactionBase):
 
 		from erpnext.crm.utils import copy_comments, link_communications
 
-		copy_comments("Lead", self.lead_name, self)
-		link_communications("Lead", self.lead_name, self)
+		copy_comments("Lead", self.lead_name, self, self.flags.ignore_permissions)
+		link_communications("Lead", self.lead_name, self, self.flags.ignore_permissions)
 
 	def validate_name_with_customer_group(self):
 		if frappe.db.exists("Customer Group", self.name):
@@ -394,6 +446,21 @@ class Customer(TransactionBase):
 				),
 				frappe.NameError,
 			)
+
+	def validate_prospect_not_converted(self):
+		if not (self.is_new() and self.prospect_name):
+			return
+
+		customer = frappe.db.exists("Customer", {"prospect_name": self.prospect_name})
+		if not customer:
+			return
+
+		message = _("Prospect {0} is already converted to a Customer").format(frappe.bold(self.prospect_name))
+		if frappe.has_permission("Customer", "read", customer):
+			message = _("Prospect {0} is already converted to Customer {1}").format(
+				frappe.bold(self.prospect_name), get_link_to_form("Customer", customer)
+			)
+		frappe.throw(message, frappe.DuplicateEntryError)
 
 	def validate_customer_group(self):
 		if not self.customer_group:
@@ -532,6 +599,13 @@ def get_nested_links(link_doctype, link_name, ignore_permissions=False):
 	return links
 
 
+def is_customer_blocked(customer: str) -> bool:
+	on_hold, release_date = frappe.db.get_value("Customer", customer, ["on_hold", "release_date"])
+	if not on_hold:
+		return False
+	return not release_date or getdate(today()) <= getdate(release_date)
+
+
 def check_credit_limit(customer, company, ignore_outstanding_sales_order=False, extra_amount=0):
 	credit_limit = get_credit_limit(customer, company)
 	if not credit_limit:
@@ -574,11 +648,8 @@ def check_credit_limit(customer, company, ignore_outstanding_sales_order=False, 
 
 			# if the current user does not have permissions to override credit limit,
 			# prompt them to send out an email to the controller users
-			frappe.msgprint(
-				message,
-				title=_("Credit Limit Crossed"),
-				raise_exception=1,
-				primary_action={
+			primary_action = (
+				{
 					"label": "Send Email",
 					"server_action": "erpnext.selling.doctype.customer.customer.send_emails",
 					"hide_on_success": True,
@@ -588,7 +659,16 @@ def check_credit_limit(customer, company, ignore_outstanding_sales_order=False, 
 						"credit_limit": credit_limit,
 						"credit_controller_users_list": credit_controller_users,
 					},
-				},
+				}
+				if frappe.has_permission("Customer", ptype="email", doc=customer)
+				else None
+			)
+
+			frappe.msgprint(
+				message,
+				title=_("Credit Limit Crossed"),
+				raise_exception=1,
+				primary_action=primary_action,
 			)
 
 
@@ -596,6 +676,7 @@ def check_credit_limit(customer, company, ignore_outstanding_sales_order=False, 
 def send_emails(
 	customer: str, customer_outstanding: float, credit_limit: float, credit_controller_users_list: str | list
 ):
+	frappe.has_permission("Customer", ptype="email", doc=customer, throw=True)
 	credit_controller_users_list = frappe.parse_json(credit_controller_users_list)
 	subject = _("Credit limit reached for customer {0}").format(customer)
 	message = _("Credit limit has been crossed for customer {0} ({1}/{2})").format(
@@ -852,6 +933,16 @@ def get_credit_limit(customer, company):
 def get_customer_primary(doctype: str, txt: str, searchfield: str, start: int, page_len: int, filters: dict):
 	customer = filters.get("customer")
 	type = filters.get("type")
+
+	# `type` is caller-supplied and was interpolated straight into qb.DocType(), so any doctype on
+	# the site could be joined to Dynamic Link and read. The two pickers that call this
+	# (customer.js:84,94) send only these two values.
+	if type not in ("Contact", "Address"):
+		frappe.throw(_("Invalid type"), frappe.PermissionError)
+
+	# authorise the party, not Contact/Address: the `if_owner` row on Address would empty the picker rather than error
+	frappe.has_permission("Customer", doc=customer, throw=True)
+
 	type_doctype = qb.DocType(type)
 	dlink = qb.DocType("Dynamic Link")
 

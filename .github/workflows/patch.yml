@@ -2,15 +2,6 @@ name: Patch
 
 on:
   pull_request:
-    paths-ignore:
-      - '**.js'
-      - '**.css'
-      - '**.md'
-      - '**.html'
-      - '**.csv'
-      - 'crowdin.yml'
-      - '.coderabbit.yml'
-      - '.mergify.yml'
   workflow_dispatch:
 
 permissions:
@@ -22,6 +13,10 @@ concurrency:
 
 jobs:
   test:
+    if: >-
+      (github.event_name != 'pull_request'
+      || (github.event.pull_request.user.login == 'mergify[bot]' && startsWith(github.head_ref, 'mergify/merge-queue/'))
+      || (startsWith(github.base_ref, 'version-') && !endsWith(github.base_ref, '-hotfix')))
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -121,6 +116,8 @@ jobs:
         env:
           DB: mariadb
           TYPE: server
+          # Anonymous git to github.com gets throttled to a 401; authenticate the clones.
+          CI_GITHUB_TOKEN: ${{ github.token }}
 
       - name: Run Patch Tests
         run: |

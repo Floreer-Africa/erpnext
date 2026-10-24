@@ -1,7 +1,6 @@
 # Copyright (c) 2022, Frappe Technologies Pvt. Ltd. and Contributors
 # License: GNU General Public License v3. See license.txt
 
-import functools
 import re
 from collections import deque
 
@@ -16,7 +15,7 @@ from frappe.website.website_generator import WebsiteGenerator
 
 import erpnext
 from erpnext.setup.utils import get_exchange_rate
-from erpnext.stock.doctype.item.item import get_item_details
+from erpnext.stock.doctype.item.item import _get_item_details
 from erpnext.stock.get_item_details import get_conversion_factor, get_price_list_rate
 
 form_grid_templates = {"items": "templates/form_grid/item_grid.html"}
@@ -156,7 +155,7 @@ class BOM(WebsiteGenerator):
 		currency: DF.Link
 		default_source_warehouse: DF.Link | None
 		default_target_warehouse: DF.Link | None
-		description: DF.SmallText | None
+		description: DF.TextEditor | None
 		exploded_items: DF.Table[BOMExplosionItem]
 		fg_based_operating_cost: DF.Check
 		has_variants: DF.Check
@@ -185,7 +184,6 @@ class BOM(WebsiteGenerator):
 		secondary_items: DF.Table[BOMSecondaryItem]
 		secondary_items_cost: DF.Currency
 		set_qty_based_on_percentage: DF.Check
-		set_rate_of_sub_assembly_item_based_on_bom: DF.Check
 		show_in_website: DF.Check
 		show_items: DF.Check
 		show_operations: DF.Check
@@ -307,9 +305,6 @@ class BOM(WebsiteGenerator):
 		self._validate_materials_and_cost()
 		self._validate_uoms_and_goods()
 
-		if self.docstatus == 1:
-			self.validate_raw_materials_of_operation()
-
 	def _validate_setup(self):
 		self.clear_operations()
 		self.clear_inspection()
@@ -329,9 +324,9 @@ class BOM(WebsiteGenerator):
 		self.validate_transfer_against()
 		self.set_routing_operations()
 		self.validate_operations()
+		self.update_stock_qty()
 		self.calculate_cost()
 		self.update_exploded_items(save=False)
-		self.update_stock_qty()
 		self.update_cost(update_parent=False, from_child_bom=True, update_hour_rate=False, save=False)
 
 	def _validate_uoms_and_goods(self):
@@ -341,7 +336,7 @@ class BOM(WebsiteGenerator):
 		self.validate_semi_finished_goods()
 		self.validate_batch_split_operations()
 		self.validate_secondary_items()
-		self.set_fg_cost_allocation()
+		self.validate_secondary_items_cost()
 		self.validate_total_cost_allocation()
 
 	def set_operation_finished_goods(self):
@@ -352,49 +347,85 @@ class BOM(WebsiteGenerator):
 			return
 
 		for row in self.operations:
+			if row.bom_no and not row.finished_good:
+				row.finished_good = frappe.get_cached_value("BOM", row.bom_no, "item")
+
+		self.set_default_last_step()
+
+		for row in self.operations:
 			if row.is_final_finished_good and not row.finished_good:
 				row.finished_good = self.item
-			elif row.bom_no and not row.finished_good:
-				row.finished_good = frappe.get_cached_value("BOM", row.bom_no, "item")
+
+	def set_default_last_step(self):
+		if not self.operations or any(row.is_final_finished_good for row in self.operations):
+			return
+
+		makes_bom_item = [row for row in self.operations if row.finished_good == self.item]
+		if len(makes_bom_item) == 1:
+			makes_bom_item[0].is_final_finished_good = 1
+		elif not makes_bom_item and not self.operations[-1].finished_good:
+			self.operations[-1].is_final_finished_good = 1
 
 	def validate_semi_finished_goods(self):
 		if not self.track_semi_finished_goods or not self.operations:
 			return
 
-		fg_items = []
+		problems = self.get_output_item_problems() + self.get_last_step_problems()
+		if self.docstatus == 1:
+			problems.extend(self.get_raw_material_problems())
+
+		if problems:
+			frappe.throw(problems, title=_("Fix These Steps"), as_list=True)
+
+	def get_step_label(self, row):
+		return _("Step {0} ({1})").format(row.idx, bold(row.operation))
+
+	def get_output_item_problems(self):
+		problems = []
 		for row in self.operations:
 			if not row.finished_good:
-				frappe.throw(
-					_(
-						"Row #{0}: FG / Semi FG Item is required for the operation {1} as 'Track Semi Finished Goods' is enabled."
-					).format(row.idx, bold(row.operation)),
+				problems.append(
+					_("{0}: choose the Output Item, that is the item this step makes.").format(
+						self.get_step_label(row)
+					)
+				)
+			elif row.is_final_finished_good and row.finished_good != self.item:
+				problems.append(
+					_("{0}: this is the Last Step, so its Output Item must be {1}.").format(
+						self.get_step_label(row), bold(self.item)
+					)
 				)
 
-			if not row.is_final_finished_good:
-				continue
+		return problems
 
-			if row.finished_good != self.item:
-				frappe.throw(
-					_(
-						"Row #{0}: The operation {1} has 'Is Final Finished Good' checked, so its FG / Semi FG Item must be {2}."
-					).format(row.idx, bold(row.operation), bold(self.item)),
+	def get_last_step_problems(self):
+		last_steps = [row for row in self.operations if row.is_final_finished_good]
+		if not last_steps:
+			return [
+				_("Tick Last Step on the step that makes {0}. Its Output Item must be {0}.").format(
+					bold(self.item)
 				)
+			]
 
-			fg_items.append(row.finished_good)
+		if len(last_steps) > 1:
+			return [
+				_("Only one step can be the Last Step, but it is ticked on steps {0}.").format(
+					", ".join(str(row.idx) for row in last_steps)
+				)
+			]
 
-		if not fg_items:
-			frappe.throw(
-				_(
-					"Since you have enabled 'Track Semi Finished Goods', at least one operation must have 'Is Final Finished Good' checked. For that set the FG / Semi FG Item as {0} against an operation."
-				).format(bold(self.item)),
-			)
+		return []
 
-		if fg_items and len(fg_items) > 1:
-			frappe.throw(
-				_(
-					"Only one operation can have 'Is Final Finished Good' checked when 'Track Semi Finished Goods' is enabled."
-				),
-			)
+	def get_raw_material_problems(self):
+		steps_with_materials = {cint(row.operation_row_id) for row in self.items if row.operation_row_id}
+
+		return [
+			_(
+				"{0}: has no raw materials. Choose an Output Item BOM, or open the step and click Add Raw Materials."
+			).format(self.get_step_label(row))
+			for row in self.operations
+			if not row.bom_no and row.idx not in steps_with_materials
+		]
 
 	def validate_batch_split_operations(self):
 		for row in self.operations:
@@ -404,7 +435,7 @@ class BOM(WebsiteGenerator):
 			if not self.track_semi_finished_goods:
 				frappe.throw(
 					_(
-						"Row #{0}: Batch Split is only supported when 'Track Semi Finished Goods' is enabled."
+						"Row #{0}: Batch Split is only supported when 'Produce an Item at Each Operation' is enabled."
 					).format(row.idx)
 				)
 
@@ -427,8 +458,20 @@ class BOM(WebsiteGenerator):
 					)
 
 	def validate_secondary_items(self):
+		seen_items = set()
 		for item in self.secondary_items:
-			if not item.is_legacy and item.item_code == self.item:
+			# every consumer merges secondary rows by item and type, so duplicates cannot
+			# keep their own quantities, percentages or valuation mode
+			key = (item.item_code, item.secondary_item_type or "")
+			if key in seen_items:
+				frappe.throw(
+					_(
+						"Row #{0}: Item {1} is already added with the same Type in the Secondary Items table."
+					).format(item.idx, get_link_to_form("Item", item.item_code))
+				)
+			seen_items.add(key)
+
+			if item.valuation_type != "Valuation Rate" and item.item_code == self.item:
 				frappe.throw(
 					_(
 						"Row #{0}: Finished Good Item {1} cannot be added in the Secondary Items table."
@@ -441,28 +484,6 @@ class BOM(WebsiteGenerator):
 						item.idx, item.secondary_item_type, get_link_to_form("Item", item.item_code)
 					)
 				)
-
-	def validate_raw_materials_of_operation(self):
-		if not self.track_semi_finished_goods or not self.operations:
-			return
-
-		operation_idx_with_no_rm = {}
-		for row in self.operations:
-			if row.bom_no:
-				continue
-
-			operation_idx_with_no_rm[row.idx] = row
-
-		for row in self.items:
-			if row.operation_row_id and row.operation_row_id in operation_idx_with_no_rm:
-				del operation_idx_with_no_rm[row.operation_row_id]
-
-		for idx, row in operation_idx_with_no_rm.items():
-			frappe.throw(
-				_("For operation {0} at row {1}, please add raw materials or set a BOM against it.").format(
-					bold(row.operation), idx
-				),
-			)
 
 	def set_default_uom(self):
 		if not self.get("items"):
@@ -518,19 +539,31 @@ class BOM(WebsiteGenerator):
 		doc.set_status(save=True)
 
 	def set_fg_cost_allocation(self):
+		self.cost_allocation_per = flt(self.cost_allocation_per)
 		total_secondary_items_per = 0
+		own_cost = 0
 		for item in self.secondary_items:
-			total_secondary_items_per += item.cost_allocation_per
+			if item.valuation_type in ("Valuation Rate", "Manual"):
+				item.cost_allocation_per = 0
+				own_cost += flt(item.cost)
+			total_secondary_items_per += flt(item.cost_allocation_per)
 
-		if self.cost_allocation_per == 100 and total_secondary_items_per:
-			self.cost_allocation_per -= total_secondary_items_per
+		self.cost_allocation_per = flt(100 - total_secondary_items_per)
 
-		self.cost_allocation = self.raw_material_cost * (self.cost_allocation_per / 100)
+		self.cost_allocation = (self.raw_material_cost - own_cost) * (self.cost_allocation_per / 100)
+
+	def validate_secondary_items_cost(self):
+		if flt(self.secondary_items_cost) > flt(self.raw_material_cost):
+			frappe.throw(
+				_("The cost of the secondary items cannot exceed the raw material cost of {0}.").format(
+					frappe.bold(flt(self.raw_material_cost))
+				)
+			)
 
 	def validate_total_cost_allocation(self):
-		total_cost_allocation_per = self.cost_allocation_per
+		total_cost_allocation_per = flt(self.cost_allocation_per)
 		for item in self.secondary_items:
-			total_cost_allocation_per += item.cost_allocation_per
+			total_cost_allocation_per += flt(item.cost_allocation_per)
 
 		if total_cost_allocation_per != 100:
 			frappe.throw(_("Cost allocation between finished goods and secondary items should equal 100%"))
@@ -540,7 +573,7 @@ class BOM(WebsiteGenerator):
 		self.manage_default_bom()
 
 	def get_item_det(self, item_code):
-		item = get_item_details(item_code)
+		item = _get_item_details(item_code)
 
 		if not item:
 			frappe.throw(_("Item: {0} does not exist in the system").format(item_code))
@@ -600,6 +633,8 @@ class BOM(WebsiteGenerator):
 					"conversion_factor": item.conversion_factor,
 					"sourced_by_supplier": item.sourced_by_supplier,
 					"do_not_explode": item.do_not_explode,
+					"set_rate_of_sub_assembly_item_based_on_bom": item.set_rate_of_sub_assembly_item_based_on_bom,
+					"source_warehouse": item.source_warehouse or self.default_source_warehouse,
 					"fetch_rate": True,
 				}
 			)
@@ -705,9 +740,19 @@ class BOM(WebsiteGenerator):
 
 	def _unset_default_bom(self):
 		self.db_set("is_default", 0)
-		item = frappe.get_doc("Item", self.item)
-		if item.default_bom == self.name:
-			frappe.db.set_value("Item", self.item, "default_bom", None)
+		if frappe.db.get_value("Item", self.item, "default_bom") != self.name:
+			return
+
+		next_default = frappe.db.get_value(
+			"BOM",
+			{"item": self.item, "docstatus": 1, "is_active": 1, "name": ("!=", self.name)},
+			"name",
+			order_by="creation desc",
+		)
+		if next_default:
+			frappe.db.set_value("BOM", next_default, "is_default", 1)
+
+		frappe.db.set_value("Item", self.item, "default_bom", next_default)
 
 	def clear_operations(self):
 		if not self.with_operations:
@@ -741,7 +786,7 @@ class BOM(WebsiteGenerator):
 		if self.track_semi_finished_goods:
 			frappe.throw(
 				_(
-					"'Set Component Quantities Based On Percentage' cannot be used together with 'Track Semi Finished Goods', as the component rows are derived from the operation BOMs."
+					"'Set Component Quantities Based On Percentage' cannot be used together with 'Produce an Item at Each Operation', as the component rows are derived from the operation BOMs."
 				),
 				title=_("Invalid Formulation"),
 			)
@@ -847,7 +892,19 @@ class BOM(WebsiteGenerator):
 	def set_plc_conversion_rate(self):
 		if self.rm_cost_as_per in ["Valuation Rate", "Last Purchase Rate"]:
 			self.plc_conversion_rate = 1
-		elif not self.plc_conversion_rate and self.price_list_currency:
+			return
+
+		if self.buying_price_list:
+			self.price_list_currency = frappe.get_cached_value(
+				"Price List", self.buying_price_list, "currency"
+			)
+
+		if not self.price_list_currency:
+			return
+
+		if self.price_list_currency == self.company_currency():
+			self.plc_conversion_rate = 1
+		elif flt(self.plc_conversion_rate) in (0, 1) or self.has_value_changed("buying_price_list"):
 			self.plc_conversion_rate = get_exchange_rate(
 				self.price_list_currency, self.company_currency(), args="for_buying"
 			)
@@ -874,6 +931,19 @@ class BOM(WebsiteGenerator):
 			frappe.throw(
 				_("Fixed Asset item {0} cannot be used in BOMs.").format(
 					", ".join(get_link_to_form("Item", item) for item in fixed_asset_items)
+				)
+			)
+
+		bom_items = {self.item, *items}
+		bom_items.update(d.item_code for d in self.get("secondary_items"))
+		bom_items.update(d.finished_good for d in self.get("operations") if d.finished_good)
+
+		if disabled_items := frappe.db.get_all(
+			"Item", filters={"item_code": ("in", list(bom_items)), "disabled": 1}, pluck="name"
+		):
+			frappe.throw(
+				_("Disabled Item {0} cannot be used in BOMs.").format(
+					", ".join(get_link_to_form("Item", item) for item in disabled_items)
 				)
 			)
 
@@ -919,7 +989,27 @@ class BOM(WebsiteGenerator):
 
 		for row in self.get("operations"):
 			if row.bom_no and row.finished_good:
-				self.add_materials_from_bom(row.finished_good, row.bom_no, row.idx, qty=row.finished_good_qty)
+				self.add_materials_from_bom(
+					row.finished_good,
+					row.bom_no,
+					row.idx,
+					qty=row.finished_good_qty,
+					replace=self.operation_bom_changed(row),
+				)
+
+	def operation_bom_changed(self, row):
+		doc_before_save = self.get_doc_before_save()
+		if not doc_before_save:
+			return False
+
+		old_row = next((d for d in doc_before_save.operations if d.name == row.name), None)
+		if not old_row or old_row.bom_no == row.bom_no:
+			return False
+
+		return get_step_material_names(doc_before_save, old_row.idx) == get_step_material_names(self, row.idx)
+
+	def remove_operation_materials(self, operation_row_id):
+		self.set("items", [row for row in self.items if cint(row.operation_row_id) != cint(operation_row_id)])
 
 	@frappe.whitelist()
 	def add_raw_materials(self, operation_row_id: int, items: str | list):
@@ -934,7 +1024,7 @@ class BOM(WebsiteGenerator):
 	def _add_raw_material_row(self, operation_row_id, row):
 		row = parse_json(row)
 
-		row.update(get_item_details(row.get("item_code")))
+		row.update(_get_item_details(row.get("item_code")))
 		row.operation_row_id = operation_row_id
 
 		item_row = self.get_item_data(row.item_code, operation_row_id)
@@ -966,10 +1056,18 @@ class BOM(WebsiteGenerator):
 
 	@frappe.whitelist()
 	def add_materials_from_bom(
-		self, finished_good: str, bom_no: str, operation_row_id: int, qty: float | None = None
+		self,
+		finished_good: str,
+		bom_no: str,
+		operation_row_id: int,
+		qty: float | None = None,
+		replace: bool = False,
 	):
 		if not frappe.db.exists("BOM", {"item": finished_good, "name": bom_no, "docstatus": 1}):
 			frappe.throw(_("BOM {0} not found for the item {1}").format(bom_no, finished_good))
+
+		if replace:
+			self.remove_operation_materials(operation_row_id)
 
 		if self.items and not self.items[0].item_code:
 			self.set("items", [])
@@ -1022,27 +1120,50 @@ class BOM(WebsiteGenerator):
 	def company_currency(self):
 		return erpnext.get_company_currency(self.company)
 
-	def validate_bom_links(self):
-		if not self.is_active:
-			bom_item = frappe.qb.DocType("BOM Item")
-			bom = frappe.qb.DocType("BOM")
-			act_pbom = (
-				frappe.qb.from_(bom_item)
-				.join(bom)
-				.on(bom.name == bom_item.parent)
-				.select(bom_item.parent)
-				.distinct()
-				.where(
-					(bom_item.bom_no == self.name)
-					& (bom_item.docstatus == 1)
-					& (bom_item.parenttype == "BOM")
-					& (bom.docstatus == 1)
-					& (bom.is_active == 1)
-				)
-			).run()
+	def validate_child_boms_on_reactivation(self):
+		if not self.is_active or not self.has_value_changed("is_active"):
+			return
 
-			if act_pbom and act_pbom[0][0]:
-				frappe.throw(_("Cannot deactivate or cancel BOM as it is linked with other BOMs"))
+		child_boms = {row.bom_no for row in self.items + self.operations if row.get("bom_no")}
+		if not child_boms:
+			return
+
+		unusable = frappe.get_all(
+			"BOM",
+			filters={"name": ("in", list(child_boms))},
+			or_filters={"is_active": 0, "docstatus": ("!=", 1)},
+			pluck="name",
+		)
+		if unusable:
+			frappe.throw(
+				_("Cannot activate BOM {0} because sub-assembly BOMs {1} are not active").format(
+					frappe.bold(self.name), ", ".join(frappe.bold(bom) for bom in unusable)
+				)
+			)
+
+	def validate_bom_links(self):
+		self.validate_child_boms_on_reactivation()
+		if not self.is_active:
+			bom = frappe.qb.DocType("BOM")
+			for doctype in ("BOM Item", "BOM Operation"):
+				child = frappe.qb.DocType(doctype)
+				act_pbom = (
+					frappe.qb.from_(child)
+					.join(bom)
+					.on(bom.name == child.parent)
+					.select(child.parent)
+					.where(
+						(child.bom_no == self.name)
+						& (child.docstatus == 1)
+						& (child.parenttype == "BOM")
+						& (bom.docstatus == 1)
+						& (bom.is_active == 1)
+					)
+					.limit(1)
+				).run()
+
+				if act_pbom and act_pbom[0][0]:
+					frappe.throw(_("Cannot deactivate or cancel BOM as it is linked with other BOMs"))
 
 	def validate_transfer_against(self):
 		if not self.with_operations:
@@ -1056,8 +1177,16 @@ class BOM(WebsiteGenerator):
 			)
 
 	def set_routing_operations(self):
+		self.validate_routing()
 		if self.routing and self.with_operations and not self.operations:
 			self.get_routing()
+
+	def validate_routing(self):
+		if not self.routing or not self.has_value_changed("routing"):
+			return
+
+		if frappe.db.get_value("Routing", self.routing, "disabled"):
+			frappe.throw(_("Routing {0} is disabled").format(get_link_to_form("Routing", self.routing)))
 
 	def validate_operations(self):
 		if self.with_operations and not self.get("operations") and self.docstatus == 1:
@@ -1118,7 +1247,8 @@ class BOM(WebsiteGenerator):
 
 	def has_scrap_items(self):
 		return any(
-			d.get("secondary_item_type") == "Scrap" or d.get("is_legacy") for d in self.get("secondary_items")
+			d.get("secondary_item_type") == "Scrap" or d.get("valuation_type") == "Valuation Rate"
+			for d in self.get("secondary_items")
 		)
 
 	def validate_bom_currency(self, item):
@@ -1135,11 +1265,15 @@ class BOM(WebsiteGenerator):
 		update_hour_rate: bool = True,
 		save: bool = True,
 	):
+		if cint(save) and not self.is_new():
+			self.load_from_db()
+			self.check_permission("write")
+
 		return BOMCostingService(self).update_cost(
-			update_parent=update_parent,
+			update_parent=cint(update_parent) and cint(save),
 			from_child_bom=from_child_bom,
 			update_hour_rate=update_hour_rate,
-			save=save,
+			save=cint(save),
 		)
 
 	def update_parent_cost(self):
@@ -1240,7 +1374,9 @@ def _get_price_list_item_rate(args, bom_doc):
 
 def get_valuation_rate(data):
 	"""
-	1) Get average valuation rate from all warehouses
+	1) Get average valuation rate from the scoping warehouse if one is passed
+	   (source warehouse for raw materials, default target warehouse for secondary
+	   items), else from all warehouses
 	2) If no value, get last valuation rate from SLE
 	3) If no value, get valuation rate from Item
 	"""
@@ -1279,8 +1415,12 @@ def _get_avg_valuation_rate_from_bins(item_code, company, data):
 		.where((bin_table.item_code == item_code) & (wh_table.company == company))
 	)
 
+	warehouse = data.get("source_warehouse")
 	if data.get("set_rate_based_on_warehouse") and data.get("warehouse"):
-		item_valuation = item_valuation.where(bin_table.warehouse == data.get("warehouse"))
+		warehouse = data.get("warehouse")
+
+	if warehouse:
+		item_valuation = item_valuation.where(bin_table.warehouse == warehouse)
 
 	return item_valuation.run(as_dict=True)[0].get("valuation_rate")
 
@@ -1304,6 +1444,10 @@ def get_list_context(context):
 	# context.introduction = _('Boms')
 
 
+def get_step_material_names(bom, operation_row_id):
+	return {row.name for row in bom.items if cint(row.operation_row_id) == cint(operation_row_id)}
+
+
 def get_bom_items_as_dict(
 	bom,
 	company,
@@ -1312,7 +1456,11 @@ def get_bom_items_as_dict(
 	fetch_secondary_items=0,
 	include_non_stock_items=False,
 	fetch_qty_in_stock_uom=True,
+	ignore_permissions=True,
 ):
+	if not ignore_permissions:
+		frappe.has_permission("BOM", "read", doc=bom, throw=True)
+
 	item_dict = {}
 	opts = frappe._dict(
 		qty=qty,
@@ -1320,6 +1468,7 @@ def get_bom_items_as_dict(
 		fetch_secondary_items=fetch_secondary_items,
 		include_non_stock_items=include_non_stock_items,
 		fetch_qty_in_stock_uom=fetch_qty_in_stock_uom,
+		ignore_permissions=ignore_permissions,
 	)
 
 	items = _query_bom_items(bom, company, opts)
@@ -1441,6 +1590,7 @@ def _build_base_bom_items_query(bom, company, qty, t):
 			Min(t.bom_item.idx).as_("idx"),
 			Max(t.item_doc.item_name).as_("item_name"),
 			(Sum(t.qty_field_col / IfNull(t.bom_doc.quantity, 1)) * qty).as_("qty"),
+			(Sum(t.bom_item.stock_qty / IfNull(t.bom_doc.quantity, 1)) * qty).as_("stock_qty"),
 			Max(t.item_doc.image).as_("image"),
 			Max(t.bom_doc.project).as_("project"),
 			Max(t.item_doc.stock_uom).as_("stock_uom"),
@@ -1498,18 +1648,18 @@ def _add_exploded_item_columns(query, t, bom, amount_col, stock_item_condition):
 
 
 def _add_secondary_item_columns(query, t, stock_item_condition):
-	# non-grouped columns are constant per grouped item_code -> Max() keeps the GROUP BY valid on
-	# postgres while returning the same value MySQL picked arbitrarily.
+	# grouped by (item_code, secondary_item_type), which the BOM keeps unique, so every Max()
+	# below returns the single grouped row's own value while keeping the GROUP BY valid on
+	# postgres.
 	query = query.select(
 		Max(t.item_doc.description).as_("description"),
 		Max(t.bom_item.cost_allocation_per).as_("cost_allocation_per"),
 		Max(t.bom_item.process_loss_per).as_("process_loss_per"),
-		Max(t.bom_item.secondary_item_type).as_("secondary_item_type"),
+		t.bom_item.secondary_item_type,
 		Max(t.bom_item.name).as_("name"),
-		Max(t.bom_item.is_legacy).as_("is_legacy"),
 	).where(stock_item_condition)
 
-	return query, [t.bom_item.item_code]
+	return query, [t.bom_item.item_code, t.bom_item.secondary_item_type]
 
 
 def _add_normal_item_columns(query, t, amount_col, stock_item_condition, track_semi_finished_goods):
@@ -1549,29 +1699,34 @@ def _add_normal_item_columns(query, t, amount_col, stock_item_condition, track_s
 
 def _add_bom_item_to_dict(item_dict, item, company, opts):
 	key = item.item_code
+	if opts.fetch_secondary_items:
+		key = (item.item_code, item.secondary_item_type or "")
+
 	if item.operation_row_id:
 		key = (item.item_code, item.operation_row_id)
 
 	if item.operation:
 		key = (item.item_code, item.operation)
 
+	stock_qty = item.pop("stock_qty")
 	if item.get("is_phantom_item"):
-		_merge_phantom_bom_items(item_dict, item, company, opts)
+		_merge_phantom_bom_items(item_dict, item, stock_qty, company, opts)
 	elif key in item_dict:
 		item_dict[key]["qty"] += flt(item.qty)
 	else:
 		item_dict[key] = item
 
 
-def _merge_phantom_bom_items(item_dict, item, company, opts):
+def _merge_phantom_bom_items(item_dict, item, stock_qty, company, opts):
 	data = get_bom_items_as_dict(
 		item.get("bom_no"),
 		company,
-		qty=item.get("qty"),
+		qty=stock_qty,
 		fetch_exploded=opts.fetch_exploded,
 		fetch_secondary_items=opts.fetch_secondary_items,
 		include_non_stock_items=opts.include_non_stock_items,
 		fetch_qty_in_stock_uom=opts.fetch_qty_in_stock_uom,
+		ignore_permissions=opts.ignore_permissions,
 	)
 
 	for k, v in data.items():
@@ -1611,9 +1766,13 @@ def _set_default_accounts_for_items(item_dict, company):
 
 @frappe.whitelist()
 def get_bom_items(bom: str, company: str, qty: float = 1, fetch_exploded: int = 1):
-	items = get_bom_items_as_dict(bom, company, qty, fetch_exploded, include_non_stock_items=True).values()
+	frappe.has_permission("BOM", "read", doc=bom, throw=True)
+
+	items = get_bom_items_as_dict(
+		bom, company, qty, fetch_exploded, include_non_stock_items=True, ignore_permissions=False
+	).values()
 	items = list(items)
-	items.sort(key=functools.cmp_to_key(lambda a, b: a.item_code > b.item_code and 1 or -1))
+	items.sort(key=lambda item: item.item_code)
 	return items
 
 

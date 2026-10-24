@@ -20,7 +20,6 @@ from erpnext.buying.doctype.purchase_order.services.status import StatusService
 from erpnext.buying.doctype.purchase_order.services.subcontracting import SubcontractingService
 from erpnext.buying.utils import validate_for_items
 from erpnext.controllers.buying_controller import BuyingController
-from erpnext.controllers.status_updater import get_allowance_for
 from erpnext.manufacturing.doctype.blanket_order.blanket_order import (
 	validate_against_blanket_order,
 )
@@ -116,6 +115,7 @@ class PurchaseOrder(BuyingController):
 		pricing_rules: DF.Table[PricingRuleDetail]
 		project: DF.Link | None
 		ref_sq: DF.Link | None
+		remarks: DF.SmallText | None
 		represents_company: DF.Link | None
 		rounded_total: DF.Currency
 		rounding_adjustment: DF.Currency
@@ -178,7 +178,15 @@ class PurchaseOrder(BuyingController):
 				"global_allowance_field": "over_order_allowance",
 				"global_allowance_doctype": "Buying Settings",
 				"item_allowance_field": "over_order_allowance",
-			}
+			},
+			{
+				"source_dt": "Purchase Order Item",
+				"target_dt": "Supplier Quotation Item",
+				"join_field": "supplier_quotation_item",
+				"target_field": "ordered_qty",
+				"target_ref_field": "stock_qty",
+				"source_field": "stock_qty",
+			},
 		]
 
 	def onload(self):
@@ -188,9 +196,6 @@ class PurchaseOrder(BuyingController):
 	def before_validate(self):
 		self.set_has_unit_price_items()
 		self.flags.allow_zero_qty = self.has_unit_price_items
-
-		if self.is_subcontracted:
-			self.status_updater[0]["source_field"] = "fg_item_qty"
 
 	def validate(self):
 		super().validate()
@@ -218,12 +223,14 @@ class PurchaseOrder(BuyingController):
 			self.doctype, self.supplier, self.company, self.inter_company_order_reference
 		)
 		self.reset_default_field_value("set_warehouse", "items", "warehouse")
+		self.set_missing_terms()
 
 	def set_has_unit_price_items(self):
 		"""
 		If permitted in settings and any item has 0 qty, the PO has unit price items.
 		"""
 		if not frappe.db.get_single_value("Buying Settings", "allow_zero_qty_in_purchase_order"):
+			self.has_unit_price_items = 0
 			return
 
 		self.has_unit_price_items = any(
@@ -250,6 +257,7 @@ class PurchaseOrder(BuyingController):
 						["conversion_factor", "="],
 					],
 					"is_child_table": True,
+					"allow_duplicate_prev_row_id": True,
 				},
 				"Material Request": {
 					"ref_dn_field": "material_request",
@@ -272,7 +280,7 @@ class PurchaseOrder(BuyingController):
 	def validate_supplier(self):
 		prevent_po = frappe.db.get_value("Supplier", self.supplier, "prevent_pos")
 		if prevent_po:
-			standing = frappe.db.get_value("Supplier Scorecard", self.supplier, "status")
+			standing = frappe.db.get_value("Supplier Scorecard", {"supplier": self.supplier}, "status")
 			if standing:
 				frappe.throw(
 					_("Purchase Orders are not allowed for {0} due to a scorecard standing of {1}.").format(
@@ -282,7 +290,7 @@ class PurchaseOrder(BuyingController):
 
 		warn_po = frappe.db.get_value("Supplier", self.supplier, "warn_pos")
 		if warn_po:
-			standing = frappe.db.get_value("Supplier Scorecard", self.supplier, "status")
+			standing = frappe.db.get_value("Supplier Scorecard", {"supplier": self.supplier}, "status")
 			frappe.msgprint(
 				_(
 					"{0} currently has a {1} Supplier Scorecard standing, and Purchase Orders to this supplier should be issued with caution."
@@ -402,6 +410,28 @@ class PurchaseOrder(BuyingController):
 	def update_status(self, status):
 		StatusService(self).update_status(status)
 
+	def on_item_close_status_change(self):
+		StatusService(self).recalculate_after_item_close()
+
+	def is_item_closable(self, item):
+		return flt(item.received_qty) < flt(item.qty) or super().is_item_closable(item)
+
+	def update_prevdoc_status(self):
+		if self.is_subcontracted:
+			self.status_updater[0]["source_field"] = "fg_item_qty"
+
+		super().update_prevdoc_status()
+
+		for supplier_quotation in {item.supplier_quotation for item in self.items}:
+			if not supplier_quotation:
+				continue
+
+			doc = frappe.get_doc("Supplier Quotation", supplier_quotation)
+			if doc.docstatus.is_cancelled():
+				frappe.throw(_("Supplier Quotation {0} is cancelled").format(supplier_quotation))
+
+			doc.set_status(update=True)
+
 	def on_submit(self):
 		super().on_submit()
 
@@ -412,8 +442,7 @@ class PurchaseOrder(BuyingController):
 			self.update_status_updater_if_from_pp()
 
 		self.update_prevdoc_status()
-		if not self.is_subcontracted:
-			self.update_requested_qty()
+		self.update_requested_qty()
 
 		self.update_ordered_qty()
 		self.validate_budget()
@@ -449,6 +478,7 @@ class PurchaseOrder(BuyingController):
 		if drop_ship_service.has_drop_ship_item():
 			drop_ship_service.set_received_qty_to_zero_for_drop_ship_items()
 			self.update_receiving_percentage()
+			drop_ship_service.update_delivered_qty_in_sales_order()
 
 		self.check_for_on_hold_or_closed_status("Material Request", "material_request")
 
@@ -458,8 +488,7 @@ class PurchaseOrder(BuyingController):
 
 		# Must be called after updating ordered qty in Material Request
 		# bin uses Material Request Items to recalculate & update
-		if not self.is_subcontracted:
-			self.update_requested_qty()
+		self.update_requested_qty()
 
 		self.update_ordered_qty()
 
@@ -499,7 +528,7 @@ class PurchaseOrder(BuyingController):
 				"source_dt": "Purchase Order Item",
 				"target_dt": "Production Plan Sub Assembly Item",
 				"join_field": "production_plan_sub_assembly_item",
-				"target_field": "received_qty",
+				"target_field": "ordered_qty",
 				"target_parent_dt": "Production Plan",
 				"target_parent_field": "",
 				"target_ref_field": "qty",
@@ -531,11 +560,9 @@ class PurchaseOrder(BuyingController):
 		considering the configured over_delivery_receipt_allowance.
 		"""
 		for item in self.get("items", []):
-			if item.delivered_by_supplier:
+			if item.delivered_by_supplier or item.closed:
 				continue
-			tolerance = flt(get_allowance_for(item.item_code, qty_or_amount="qty")[0])
-			max_receivable_qty = flt(item.qty) * (100 + tolerance) / 100
-			if abs(flt(item.received_qty)) < abs(max_receivable_qty):
+			if abs(flt(item.received_qty)) < abs(item.max_receivable_qty):
 				return True
 		return False
 
@@ -582,14 +609,19 @@ def item_last_purchase_rate(name, conversion_rate, item_code, conversion_factor=
 			return item_last_purchase_rate
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def close_or_unclose_purchase_orders(names: str | list, status: str):
-	if not frappe.has_permission("Purchase Order", "write"):
-		frappe.throw(_("Not permitted"), frappe.PermissionError)
+	frappe.has_permission("Purchase Order", "write", throw=True)
 
 	names = frappe.parse_json(names)
 	for name in names:
-		po = frappe.get_lazy_doc("Purchase Order", name)
+		if not isinstance(name, str):
+			frappe.throw(_("Invalid name"), frappe.PermissionError)
+
+		# the check above is doctype level and never consults User Permissions, so on its own it
+		# lets a caller restricted to one company close another company's orders. Checking each
+		# document is what scopes it, and matches what update_status() below already does.
+		po = frappe.get_lazy_doc("Purchase Order", name, check_permission="submit")
 		if po.docstatus == 1:
 			if status == "Closed":
 				if po.status not in ("Cancelled", "Closed") and (
@@ -620,8 +652,14 @@ def get_list_context(context=None):
 	return list_context
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["POST"])
 def update_status(status: str, name: str):
+	if status not in ("Draft", "Submitted", "On Hold", "Closed"):
+		frappe.throw(_("Cannot set the status of a Purchase Order to {0}.").format(status))
+
 	po = frappe.get_lazy_doc("Purchase Order", name, check_permission="submit")
+	if po.docstatus != 1:
+		frappe.throw(_("Only a submitted Purchase Order can be held, closed or re-opened."))
+
 	po.update_status(status)
 	DropShipService(po).update_delivered_qty_in_sales_order()

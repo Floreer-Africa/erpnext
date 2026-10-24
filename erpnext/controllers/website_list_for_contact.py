@@ -8,9 +8,28 @@ import frappe
 from frappe import _
 from frappe.modules.utils import get_module_app
 from frappe.query_builder import Criterion
-from frappe.query_builder.functions import Lower
+from frappe.query_builder.functions import Lower, Max
 from frappe.utils import cint, flt, has_common
 from frappe.utils.user import is_website_user
+
+# fields read by templates/includes/transaction_row.html
+PORTAL_ROW_FIELDS = (
+	"name",
+	"docstatus",
+	"status",
+	"modified",
+	"currency",
+	"grand_total",
+	"rounded_total",
+	"disable_rounded_total",
+)
+PORTAL_ROW_DISPLAY_KEYS = (
+	"indicator_color",
+	"indicator_title",
+	"status_percent",
+	"status_display",
+	"items_preview",
+)
 
 
 def get_list_context(context=None):
@@ -223,11 +242,10 @@ def rfq_transaction_list(parties_doctype, doctype, parties, limit_start, limit_p
 	party = frappe.qb.DocType(parties_doctype)
 	data = (
 		frappe.qb.from_(party)
-		# creation must be selected: Postgres requires SELECT DISTINCT order-by exprs in the select list
-		.select(party.parent.as_("name"), party.supplier, party.creation)
-		.distinct()
+		.select(party.parent.as_("name"))
 		.where(party.supplier.isin(parties) & (party.docstatus == 1))
-		.orderby(party.creation, order=frappe.qb.desc)
+		.groupby(party.parent)
+		.orderby(Max(party.creation), order=frappe.qb.desc)
 		.limit(limit_page_length)
 		.offset(limit_start)
 	).run(as_dict=True)
@@ -262,9 +280,21 @@ def post_process(doctype, data):
 
 		doc.status_display = ", ".join(doc.status_display)
 		doc.items_preview = ", ".join(d.item_name for d in doc.items if d.item_name)
-		result.append(doc)
+		result.append(get_portal_row(doc))
 
 	return result
+
+
+def get_portal_row(doc):
+	"""Return a copy of `doc` with only the values the portal row shows.
+
+	The list is also returned as JSON, so the full document would expose cost and margin fields.
+	"""
+	row = frappe.get_doc({"doctype": doc.doctype, **{f: doc.get(f) for f in PORTAL_ROW_FIELDS}})
+	for key in PORTAL_ROW_DISPLAY_KEYS:
+		row.set(key, doc.get(key))
+
+	return row
 
 
 def get_customers_suppliers(doctype, user):
@@ -278,12 +308,11 @@ def get_customers_suppliers(doctype, user):
 	has_supplier_field = meta.has_field("supplier")
 
 	if has_common(["Supplier", "Customer"], frappe.get_roles(user)):
-		# Floreer (framework#153): pass `user` through. Upstream ignored the
-		# argument and read frappe.session.user, so has_website_permission's
-		# explicit `user` was silently disregarded.
 		suppliers = get_parents_for_user("Supplier", user)
 		customers = get_parents_for_user("Customer", user)
-	elif frappe.has_permission(doctype, "read", user=user):
+	elif frappe.has_permission(doctype, "read", user=user) and frappe.has_permission(
+		"Customer", "read", user=user
+	):
 		customer_list = frappe.get_list("Customer")
 		customers = suppliers = [customer.name for customer in customer_list]
 
@@ -347,20 +376,20 @@ def get_parents_for_user(parenttype: str, user: str | None = None) -> list[str]:
 
 
 def has_website_permission(doc, ptype, user, verbose=False):
-	# Floreer (framework#146): grant access if EITHER the customer or the supplier
-	# link matches. Purchase Order has both a `customer` field (drop-ship) and a
-	# `supplier` field; a contact linked to both a Customer and the Supplier is
-	# party to a supplier PO via the supplier side. Upstream returned on the
-	# customer branch first, so it checked the (empty) PO.customer and 403'd the
-	# supplier — never consulting the supplier link. Check both.
+	# only portal users get access through their Customer / Supplier, everyone else
+	# goes through `has_permission`, which applies their User Permissions
+	if not has_common(["Supplier", "Customer"], frappe.get_roles(user)):
+		return False
+
 	doctype = doc.doctype
 	customers, suppliers = get_customers_suppliers(doctype, user)
 	if customers and frappe.db.exists(doctype, get_customer_filter(doc, customers)):
 		return True
+
 	if suppliers:
 		fieldname = "suppliers" if doctype == "Request for Quotation" else "supplier"
-		if frappe.db.exists(doctype, {"name": doc.name, fieldname: ["in", suppliers]}):
-			return True
+		return bool(frappe.db.exists(doctype, {"name": doc.name, fieldname: ["in", suppliers]}))
+
 	return False
 
 

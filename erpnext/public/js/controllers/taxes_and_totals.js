@@ -16,7 +16,7 @@ erpnext.taxes_and_totals = class TaxesAndTotals extends erpnext.payments {
 	apply_pricing_rule_on_item(item) {
 		let effective_item_rate = item.price_list_rate;
 		if (["Sales Order", "Quotation"].includes(item.parenttype) && item.blanket_order_rate) {
-			effective_item_rate = item.blanket_order_rate;
+			effective_item_rate = flt(item.blanket_order_rate) * (flt(item.conversion_factor) || 1);
 		}
 
 		let rate_with_margin;
@@ -96,7 +96,10 @@ erpnext.taxes_and_totals = class TaxesAndTotals extends erpnext.payments {
 	}
 
 	calculate_discount_amount() {
-		if (frappe.meta.get_docfield(this.frm.doc.doctype, "discount_amount")) {
+		if (
+			frappe.meta.get_docfield(this.frm.doc.doctype, "discount_amount") &&
+			!this.has_mapped_discount()
+		) {
 			this.set_discount_amount();
 			this.apply_discount_amount();
 		}
@@ -110,6 +113,7 @@ erpnext.taxes_and_totals = class TaxesAndTotals extends erpnext.payments {
 		this.calculate_item_values();
 		this.initialize_taxes();
 		this.determine_exclusive_rate();
+		this.apply_mapped_additional_discount();
 		this.calculate_net_total();
 		this.calculate_taxes();
 		this.adjust_grand_total_for_inclusive_tax();
@@ -117,10 +121,65 @@ erpnext.taxes_and_totals = class TaxesAndTotals extends erpnext.payments {
 		this._cleanup();
 	}
 
+	apply_mapped_additional_discount() {
+		if (this.discount_amount_applied || !this.has_mapped_discount()) return;
+
+		for (const item of this.frm._items || []) {
+			this.apply_mapped_discount_to_item(item);
+		}
+
+		const doc = this.frm.doc;
+		doc.apply_discount_on = "Net Total";
+		doc.additional_discount_percentage = 0;
+		doc.discount_amount = flt(
+			(this.frm._items || []).reduce((total, item) => total + flt(item.distributed_discount_amount), 0),
+			precision("discount_amount")
+		);
+		this.set_in_company_currency(doc, ["discount_amount"]);
+	}
+
+	apply_mapped_discount_to_item(item) {
+		item.distributed_discount_amount = flt(
+			flt(item.mapped_additional_discount_amount) * this.get_billed_stock_qty(item),
+			precision("distributed_discount_amount", item)
+		);
+		if (!item.distributed_discount_amount) return;
+
+		item.net_amount = flt(
+			item.net_amount - item.distributed_discount_amount,
+			precision("net_amount", item)
+		);
+		item.net_rate = flt(item.net_amount / this.get_billed_qty(item), precision("net_rate", item));
+		item._unrounded_net_amount = null;
+		this.set_in_company_currency(item, ["net_rate", "net_amount"]);
+	}
+
+	has_mapped_discount() {
+		return (
+			!this.frm.doc.is_consolidated &&
+			(this.frm._items || []).some((item) => flt(item.mapped_additional_discount_amount))
+		);
+	}
+
+	drop_mapped_discount(item) {
+		if (!flt(item.mapped_additional_discount_amount)) return;
+
+		item.mapped_additional_discount_amount = 0;
+		if (!this.frm.doc.items.some((row) => flt(row.mapped_additional_discount_amount))) {
+			this.frm.doc.discount_amount = 0;
+		}
+	}
+
+	clear_mapped_discounts() {
+		for (const item of this.frm.doc.items || []) {
+			item.mapped_additional_discount_amount = 0;
+		}
+	}
+
 	validate_conversion_rate() {
 		this.frm.doc.conversion_rate = flt(
 			this.frm.doc.conversion_rate,
-			cur_frm ? precision("conversion_rate") : 9
+			frappe.meta.get_field_precision(this.frm.get_docfield("conversion_rate"), this.frm.doc)
 		);
 		var conversion_rate_label = frappe.meta.get_translated_label(
 			this.frm.doc.doctype,
@@ -157,17 +216,43 @@ erpnext.taxes_and_totals = class TaxesAndTotals extends erpnext.payments {
 			.filter((fieldname) => !do_not_round_fields.includes(fieldname));
 	}
 
+	get_billed_qty(item) {
+		const settings = frappe.boot.sysdefaults || {};
+		const is_internal_transfer =
+			this.frm.doc.is_internal_supplier && this.frm.doc.represents_company === this.frm.doc.company;
+		const bills_rejected_quantity =
+			this.frm.doc.doctype === "Purchase Invoice" &&
+			this.frm.doc.update_stock &&
+			!is_internal_transfer &&
+			cint(settings.set_valuation_rate_for_rejected_materials) &&
+			cint(settings.bill_for_rejected_quantity_in_purchase_invoice);
+
+		if (!flt(item.rejected_qty) || !bills_rejected_quantity) {
+			return flt(item.qty);
+		}
+
+		return flt(item.qty) + flt(item.rejected_qty);
+	}
+
+	get_billed_stock_qty(item) {
+		return this.get_billed_qty(item) * (flt(item.conversion_factor) || 1);
+	}
+
 	calculate_item_values() {
 		var me = this;
 		if (!this.discount_amount_applied) {
 			const fields_to_round = this.get_item_fields_to_round();
 			for (const item of this.frm.doc.items || []) {
 				frappe.model.round_floats_in(item, fields_to_round);
+				item._mapped_discount_inclusive_amount = 0;
 				item.net_rate = item.rate;
 				item.qty = item.qty === undefined ? (me.frm.doc.is_return ? -1 : 1) : item.qty;
 
 				if (!(me.frm.doc.is_return || me.frm.doc.is_debit_note)) {
-					item.net_amount = item.amount = flt(item.rate * item.qty, precision("amount", item));
+					item.net_amount = item.amount = flt(
+						item.rate * me.get_billed_qty(item),
+						precision("amount", item)
+					);
 				} else {
 					// allow for '0' qty on Credit/Debit notes
 					let qty = flt(item.qty);
@@ -305,6 +390,11 @@ erpnext.taxes_and_totals = class TaxesAndTotals extends erpnext.payments {
 				total_tax_slope += tax.tax_fraction_for_current_item;
 				total_tax_intercept += tax_intercept_per_qty * flt(item.qty);
 			});
+
+			item._mapped_discount_inclusive_amount =
+				flt(item.mapped_additional_discount_amount) *
+				me.get_billed_stock_qty(item) *
+				(1 + total_tax_slope);
 
 			if (!me.discount_amount_applied && item.qty && (total_tax_intercept || total_tax_slope)) {
 				var amount = flt(item.amount) - total_tax_intercept;
@@ -689,6 +779,10 @@ erpnext.taxes_and_totals = class TaxesAndTotals extends erpnext.payments {
 					me.frm.doc.total +
 					non_inclusive_tax_amount -
 					flt(last_tax.total, precision("grand_total"));
+				diff -= (me.frm._items || []).reduce(
+					(total, item) => total + flt(item._mapped_discount_inclusive_amount),
+					0
+				);
 
 				if (me.discount_amount_applied && me.frm.doc.discount_amount) {
 					diff -= flt(me.frm.doc.discount_amount);

@@ -13,21 +13,35 @@ def get_context(context):
 	context.no_cache = 1
 	context.show_sidebar = True
 	context.doc = frappe.get_doc(frappe.form_dict.doctype, frappe.form_dict.name)
+	if context.doc.docstatus != 1:
+		frappe.throw(_("Not Permitted"), frappe.PermissionError)
+
 	context.parents = frappe.form_dict.parents
 	context.doc.supplier = get_supplier()
 	context.doc.rfq_links = get_link_quotation(context.doc.supplier, context.doc.name)
 	unauthorized_user(context.doc.supplier)
 	update_supplier_details(context)
+	context.portal_doc = get_portal_doc(context.doc)
 	prefill_previous_rates(context)
 	context["title"] = frappe.form_dict.name
+
+
+def get_portal_doc(rfq) -> dict:
+	"""The RFQ fields the supplier's quotation form needs."""
+	items = [{"name": item.name, "idx": item.idx, "qty": item.qty} for item in rfq.items]
+	return {"name": rfq.name, "items": items}
 
 
 def get_supplier():
 	doctype = frappe.form_dict.doctype
 	parties_doctype = "Request for Quotation Supplier" if doctype == "Request for Quotation" else doctype
 	customers, suppliers = get_customers_suppliers(parties_doctype, frappe.session.user)
+	if not suppliers:
+		return ""
 
-	return suppliers[0] if suppliers else ""
+	return next(
+		(supplier for supplier in suppliers if check_supplier_has_docname_access(supplier)), suppliers[0]
+	)
 
 
 def check_supplier_has_docname_access(supplier):
@@ -88,10 +102,12 @@ def prefill_previous_rates(context):
 	request input. Only history in the page's currency and the line's UOM
 	counts, so a per-kg price never prefills a per-box line.
 
-	The rate and amount are also written into `context.rfq_doc_json`, which
-	rfq.js uses as `window.doc`. Without that, a box the supplier leaves
-	untouched would show the price but submit a zero rate, because rfq.js only
-	copies a rate into `window.doc` on a change event.
+	The rate and amount are also written into `context.portal_doc` (serialised
+	as `context.rfq_doc_json`), which rfq.js uses as `window.doc`. Without that,
+	a box the supplier leaves untouched would show the price but submit a zero
+	rate, because rfq.js only copies a rate into `window.doc` on a change event.
+	It is built on upstream's minimal `get_portal_doc` payload, never on
+	`doc.as_dict()`, so the page does not embed the other invited suppliers.
 	"""
 	doc = context.doc
 	codes = list({d.item_code for d in doc.items if d.item_code})
@@ -101,9 +117,10 @@ def prefill_previous_rates(context):
 			# Later sources overwrite earlier ones, so the Supplier Quotation wins.
 			previous.update(_latest_rates(doctype, doc.supplier, doc.currency, codes))
 
-	doc_dict = doc.as_dict()
+	portal_doc = context.portal_doc
 	grand_total = 0.0
-	for d, row in zip(doc.items, doc_dict["items"], strict=True):
+	for d, row in zip(doc.items, portal_doc["items"], strict=True):
+		row["item_code"] = d.item_code
 		rate = previous.get((d.item_code, d.uom))
 		d.floreer_prev_rate = rate
 		if rate is None:
@@ -116,9 +133,9 @@ def prefill_previous_rates(context):
 		row["amount"] = amount
 		grand_total += amount
 
-	doc_dict["grand_total"] = grand_total
+	portal_doc["grand_total"] = grand_total
 	doc.floreer_prev_grand_total_display = fmt_money(grand_total, precision=2, format=doc.number_format)
-	context.rfq_doc_json = frappe.as_json(doc_dict)
+	context.rfq_doc_json = frappe.as_json(portal_doc)
 
 
 def _latest_rates(doctype, supplier, currency, item_codes):
