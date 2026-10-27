@@ -32,7 +32,7 @@ frappe.ui.form.on("Journal Entry", {
 			erpnext.journal_entry.lock_reversal_entry(frm);
 		}
 
-		erpnext.toggle_naming_series();
+		erpnext.toggle_naming_series(frm);
 		erpnext.journal_entry.add_custom_buttons(frm);
 		erpnext.journal_entry.toggle_fields_based_on_currency(frm);
 		erpnext.accounts.unreconcile_payment.add_unreconcile_btn(frm);
@@ -375,8 +375,8 @@ Object.assign(erpnext.journal_entry, {
 			],
 		});
 
-		dialog.set_primary_action(__("Save"), () => {
-			erpnext.journal_entry.save_quick_entry(frm, dialog.get_values());
+		dialog.set_primary_action(__("Save"), (values) => {
+			erpnext.journal_entry.save_quick_entry(frm, values);
 			dialog.hide();
 		});
 		dialog.show();
@@ -624,8 +624,8 @@ Object.assign(erpnext.journal_entry, {
 			total_credit += flt(row.credit, precision("credit", row));
 		});
 
-		frm.doc.total_debit = total_debit;
-		frm.doc.total_credit = total_credit;
+		frm.doc.total_debit = flt(total_debit, precision("total_debit"));
+		frm.doc.total_credit = flt(total_credit, precision("total_credit"));
 		frm.doc.difference = flt(total_debit - total_credit, precision("difference"));
 		["total_debit", "total_credit", "difference"].forEach((field) => frm.refresh_field(field));
 	},

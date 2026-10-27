@@ -97,7 +97,32 @@ def get_loyalty_program_details_with_points(
 	include_expired_entry: bool = False,
 	current_transaction_amount: int | float = 0,
 ):
-	lp_details = get_loyalty_program_details(customer, loyalty_program, company=company, silent=silent)
+	frappe.has_permission("Customer", doc=customer, throw=True)
+	return _loyalty_program_details_with_points(
+		customer,
+		loyalty_program,
+		expiry_date,
+		company,
+		silent,
+		include_expired_entry,
+		current_transaction_amount,
+	)
+
+
+# PR-Foundry/framework#306 (fork patch): the Customer check above guards the API. Sales/POS Invoice
+# submit and validate reach the same logic for a document the user may already submit, so they call
+# these unchecked helpers; a till user with no Customer read could otherwise not book a loyalty sale.
+# No bypass parameter on the whitelisted functions: anything there can be posted over the wire.
+def _loyalty_program_details_with_points(
+	customer,
+	loyalty_program=None,
+	expiry_date=None,
+	company=None,
+	silent=False,
+	include_expired_entry=False,
+	current_transaction_amount=0,
+):
+	lp_details = _loyalty_program_details(customer, loyalty_program, company=company, silent=silent)
 	loyalty_program = frappe.get_doc("Loyalty Program", loyalty_program)
 	loyalty_details = get_loyalty_details(
 		customer, loyalty_program.name, expiry_date, company, include_expired_entry
@@ -127,6 +152,18 @@ def get_loyalty_program_details(
 	silent: bool = False,
 	include_expired_entry: bool = False,
 ):
+	# Same guard as get_loyalty_program_details_with_points above: the customer is what the caller
+	# is entitled to, not the programme. A check on Loyalty Program itself would be read-only to
+	# System Manager and would deny every role that actually fills in the two calling forms.
+	frappe.has_permission("Customer", doc=customer, throw=True)
+	return _loyalty_program_details(
+		customer, loyalty_program, expiry_date, company, silent, include_expired_entry
+	)
+
+
+def _loyalty_program_details(
+	customer, loyalty_program=None, expiry_date=None, company=None, silent=False, include_expired_entry=False
+):
 	lp_details = frappe._dict()
 
 	if not loyalty_program:
@@ -148,6 +185,13 @@ def get_loyalty_program_details(
 
 @frappe.whitelist()
 def get_redeemption_factor(loyalty_program: str | None = None, customer: str | None = None):
+	# both call sites send only `loyalty_program`, so the calling form is the boundary; the customer branch stays guarded
+	if not (frappe.has_permission("Sales Invoice") or frappe.has_permission("POS Invoice")):
+		frappe.throw(_("Not permitted"), frappe.PermissionError)
+
+	if customer:
+		frappe.has_permission("Customer", doc=customer, throw=True)
+
 	customer_loyalty_program = None
 	if not loyalty_program:
 		customer_loyalty_program = frappe.db.get_value("Customer", customer, "loyalty_program")
@@ -179,7 +223,7 @@ def validate_loyalty_points(ref_doc, points_to_redeem):
 		frappe.throw(_("The Loyalty Program isn't valid for the selected company"))
 
 	if loyalty_program and points_to_redeem:
-		loyalty_program_details = get_loyalty_program_details_with_points(
+		loyalty_program_details = _loyalty_program_details_with_points(
 			ref_doc.customer, loyalty_program, posting_date, ref_doc.company
 		)
 

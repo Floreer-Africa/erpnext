@@ -29,10 +29,13 @@ from erpnext.exceptions import (
 	QualityInspectionRejectedError,
 	QualityInspectionRequiredError,
 )
+from erpnext.projects.doctype.project.project import update_consumed_material_cost
 from erpnext.setup.doctype.brand.brand import get_brand_defaults
 from erpnext.setup.doctype.item_group.item_group import get_item_group_defaults
 from erpnext.stock import get_warehouse_account, get_warehouse_account_map
 from erpnext.stock.doctype.item.item import get_item_defaults
+from erpnext.stock.doctype.purchase_receipt.services.billing_status import is_billed_by_qty
+from erpnext.stock.serial_batch_identity import SerialBatchIdentity
 from erpnext.stock.services.internal_transfer import StockInternalTransferService
 from erpnext.stock.stock_ledger import get_items_to_be_repost
 
@@ -260,12 +263,25 @@ class StockController(AccountsController):
 		return SerialBatchBundleService(self).set_serial_and_batch_bundle(table_name, ignore_validate)
 
 	def make_package_for_transfer(
-		self, serial_and_batch_bundle, warehouse, type_of_transaction=None, do_not_submit=None, qty=0
+		self,
+		serial_and_batch_bundle,
+		warehouse,
+		type_of_transaction=None,
+		do_not_submit=None,
+		qty=0,
+		include_bundle=None,
+		exclude_serial_nos=None,
 	):
 		from erpnext.stock.services.serial_batch_bundle_service import SerialBatchBundleService
 
 		return SerialBatchBundleService(self).make_package_for_transfer(
-			serial_and_batch_bundle, warehouse, type_of_transaction, do_not_submit, qty
+			serial_and_batch_bundle,
+			warehouse,
+			type_of_transaction,
+			do_not_submit,
+			qty,
+			include_bundle,
+			exclude_serial_nos,
 		)
 
 	def get_sl_entries(self, d, args):
@@ -327,6 +343,10 @@ class StockController(AccountsController):
 		if self.doctype == "Delivery Note":
 			# Bill by amount, falling back to qty when the invoiced amount is short (e.g. rate drop).
 			args["billing_percentage"] = self.get_delivery_note_billing_percentage()
+		elif self.doctype == "Purchase Order" and is_billed_by_qty():
+			from erpnext.buying.doctype.purchase_order.services.status import StatusService
+
+			args["billing_percentage"] = StatusService(self).get_percent_billed_by_qty()
 
 		self._update_percent_field(args, update_modified)
 
@@ -337,8 +357,12 @@ class StockController(AccountsController):
 		items = frappe.get_all(
 			"Delivery Note Item",
 			filters={"parent": self.name, "parenttype": "Delivery Note"},
-			fields=["name", "qty", "returned_qty", "rate", "amount", "billed_amt"],
+			fields=["name", "qty", "returned_qty", "rate", "amount", "billed_amt", "closed"],
 		)
+		# A written off row leaves the basis. Once every row is written off there is
+		# nothing left to measure against, so fall back to the whole table.
+		items = [item for item in items if not item.closed] or items
+
 		total_amount = sum(flt(item.amount) for item in items)
 		total_returned = sum(flt(item.returned_qty) * flt(item.rate) for item in items)
 		# Preserve the original amount basis once the entire Delivery Note is returned.
@@ -390,9 +414,9 @@ class StockController(AccountsController):
 		return QualityInspectionService(self).validate_inspection()
 
 	def update_blanket_order(self):
-		blanket_orders = list(set([d.blanket_order for d in self.items if d.blanket_order]))
+		blanket_orders = sorted({d.blanket_order for d in self.items if d.blanket_order})
 		for blanket_order in blanket_orders:
-			frappe.get_doc("Blanket Order", blanket_order).update_ordered_qty()
+			frappe.get_doc("Blanket Order", blanket_order, for_update=True).update_ordered_qty()
 
 	def validate_customer_provided_item(self):
 		for d in self.get("items"):
@@ -417,6 +441,10 @@ class StockController(AccountsController):
 		from erpnext.stock.services.stock_ledger_service import StockLedgerService
 
 		return StockLedgerService(self).repost_future_sle_and_gle(force, via_landed_cost_voucher)
+
+	def update_project_consumed_material_cost(self):
+		projects = {self.get("project"), *(d.get("project") for d in self.get("items"))}
+		update_consumed_material_cost(projects - {None, ""})
 
 	def add_gl_entry(
 		self,
@@ -538,7 +566,12 @@ class StockController(AccountsController):
 						if sre_doc.has_serial_no:
 							serial_nos = [d.serial_no for d in sbb.entries]
 							for entry in sre_doc.sb_entries:
-								if entry.serial_no in serial_nos:
+								is_open = (
+									entry.qty > entry.delivered_qty
+									if self._action == "submit"
+									else entry.delivered_qty
+								)
+								if entry.serial_no in serial_nos and is_open:
 									entry.delivered_qty = 1 if self._action == "submit" else 0
 									entry.db_update()
 									working_qty += 1
@@ -637,7 +670,7 @@ def show_accounting_ledger_preview(company: str, doctype: str, docname: str):
 def show_stock_ledger_preview(company: str, doctype: str, docname: str):
 	from erpnext.controllers.ledger_preview import get_stock_ledger_preview
 
-	filters = frappe._dict(company=company)
+	filters = frappe._dict(company=company, valuation_field_type="Currency")
 	doc = frappe.get_lazy_doc(doctype, docname)
 	doc.check_permission("read")
 	doc.run_method("before_sl_preview")
@@ -743,7 +776,7 @@ def make_quality_inspections(
 				"item_code": item.get("item_code"),
 				"description": item.get("description"),
 				"sample_size": flt(item.get("sample_size")),
-				"item_serial_no": item.get("serial_no").split("\n")[0] if item.get("serial_no") else None,
+				"item_serial_no": get_first_serial_id(item),
 				"batch_no": item.get("batch_no"),
 				"child_row_reference": item.get("child_row_reference"),
 			}
@@ -752,6 +785,18 @@ def make_quality_inspections(
 		inspections.append(quality_inspection.name)
 
 	return inspections
+
+
+def get_first_serial_id(item):
+	from erpnext.stock.doctype.serial_no.serial_no import get_serial_nos
+
+	serial_numbers = get_serial_nos(item.get("serial_no"))
+	if not serial_numbers:
+		return None
+	records = SerialBatchIdentity("Serial No").get_records(
+		item.get("item_code"), serial_numbers[:1], ["name"]
+	)
+	return records[0].name if records else None
 
 
 def is_reposting_pending():
@@ -765,17 +810,20 @@ def invalidate_future_sle_cache(voucher_type, voucher_no):
 		frappe.local.future_sle.pop((voucher_type, voucher_no), None)
 
 
-def future_sle_exists(args, sl_entries=None):
+def future_sle_exists(args, sl_entries=None, for_update=False):
 	from erpnext.stock.utils import get_combine_datetime
 
 	key = (args.voucher_type, args.voucher_no)
 	if not hasattr(frappe.local, "future_sle"):
 		frappe.local.future_sle = {}
 
-	if validate_future_sle_not_exists(args, key, sl_entries):
-		return False
-	elif get_cached_data(args, key):
-		return True
+	# The locking read neither uses nor fills the cache: a cached result may come from a plain
+	# read that predates a concurrent later-posted SLE.
+	if not for_update:
+		if validate_future_sle_not_exists(args, key, sl_entries):
+			return False
+		elif get_cached_data(args, key):
+			return True
 
 	if not sl_entries:
 		sl_entries = get_sle_entries_against_voucher(args)
@@ -787,7 +835,7 @@ def future_sle_exists(args, sl_entries=None):
 	args["posting_datetime"] = get_combine_datetime(args["posting_date"], args["posting_time"])
 
 	sle = frappe.qb.DocType("Stock Ledger Entry")
-	data = (
+	query = (
 		frappe.qb.from_(sle)
 		.select(sle.item_code, sle.warehouse, Count(sle.name).as_("total_row"))
 		.where(
@@ -797,11 +845,21 @@ def future_sle_exists(args, sl_entries=None):
 			& (sle.is_cancelled == 0)
 		)
 		.groupby(sle.item_code, sle.warehouse)
-		.run(as_dict=1)
 	)
 
-	for d in data:
-		frappe.local.future_sle[key][(d.item_code, d.warehouse)] = d.total_row
+	# A plain read uses the transaction's snapshot, which can predate a later-posted SLE that a
+	# concurrent submit committed meanwhile; this voucher would then skip the repost it needs.
+	# A locking read sees the latest committed rows and waits on uncommitted ones. Only the final
+	# repost decision asks for it: by then this voucher already holds these ranges, whereas an
+	# upfront lock over every item-warehouse pair deadlocks with concurrent submits.
+	if for_update and frappe.db.db_type == "mariadb":
+		query = query.for_update()
+
+	data = query.run(as_dict=1)
+
+	if not for_update:
+		for d in data:
+			frappe.local.future_sle[key][(d.item_code, d.warehouse)] = d.total_row
 
 	return len(data)
 
@@ -888,6 +946,7 @@ def create_item_wise_repost_entries(
 	from erpnext.stock.utils import get_valuation_method
 
 	stock_ledger_entries = get_items_to_be_repost(voucher_type, voucher_no)
+	company = frappe.db.get_value(voucher_type, voucher_no, "company")
 
 	distinct_item_warehouses = set()
 	repost_entries = []
@@ -900,7 +959,7 @@ def create_item_wise_repost_entries(
 
 		# Standard Cost items don't need a full repost: a backdated entry only shifts future balances
 		# (qty and value at the standard rate), which is done in place by update_qty_in_future_sle.
-		if get_valuation_method(sle.item_code) == "Standard Cost":
+		if get_valuation_method(sle.item_code, company) == "Standard Cost":
 			continue
 
 		repost_entry = frappe.new_doc("Repost Item Valuation")
@@ -920,6 +979,23 @@ def create_item_wise_repost_entries(
 	return repost_entries
 
 
+def create_accounting_repost_entry(voucher_type, voucher_no):
+	repost_entry = frappe.new_doc("Repost Item Valuation")
+	repost_entry.based_on = "Transaction"
+	repost_entry.voucher_type = voucher_type
+	repost_entry.voucher_no = voucher_no
+	repost_entry.update(
+		frappe.db.get_value(
+			voucher_type, voucher_no, ["company", "posting_date", "posting_time"], as_dict=True
+		)
+	)
+	repost_entry.repost_only_accounting_ledgers = 1
+	repost_entry.flags.ignore_links = True
+	repost_entry.flags.ignore_permissions = True
+	repost_entry.submit()
+	return repost_entry
+
+
 def make_bundle_for_material_transfer(**kwargs):
 	if isinstance(kwargs, dict):
 		kwargs = frappe._dict(kwargs)
@@ -937,10 +1013,20 @@ def make_bundle_for_material_transfer(**kwargs):
 	bundle_doc.voucher_no = "" if kwargs.is_new or kwargs.docstatus == 2 else kwargs.voucher_no
 	bundle_doc.is_cancelled = 0
 
+	if kwargs.include_bundle:
+		for entry in frappe.get_doc("Serial and Batch Bundle", kwargs.include_bundle).entries:
+			bundle_doc.append("entries", entry.as_dict(no_default_fields=True))
+
+	if kwargs.exclude_serial_nos:
+		keep = [row for row in bundle_doc.entries if row.serial_no not in set(kwargs.exclude_serial_nos)]
+		bundle_doc.entries = keep
+		for idx, row in enumerate(keep, start=1):
+			row.idx = idx
+
 	qty = 0
 	if (
 		len(bundle_doc.entries) == 1
-		and flt(kwargs.qty) < flt(bundle_doc.total_qty)
+		and abs(flt(kwargs.qty)) < abs(flt(bundle_doc.total_qty))
 		and not bundle_doc.has_serial_no
 	):
 		qty = kwargs.qty
@@ -970,6 +1056,8 @@ def make_bundle_for_material_transfer(**kwargs):
 		bundle_doc.save(ignore_permissions=True)
 	else:
 		bundle_doc.submit()
+		if kwargs.docstatus != 2:
+			bundle_doc.check_future_entries_exists()
 
 	return bundle_doc.name
 

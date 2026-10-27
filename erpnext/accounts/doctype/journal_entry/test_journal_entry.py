@@ -1,6 +1,8 @@
 # Copyright (c) 2015, Frappe Technologies Pvt. Ltd. and Contributors
 # License: GNU General Public License v3. See license.txt
 
+from unittest.mock import patch
+
 import frappe
 from frappe.utils import add_days, flt, nowdate
 
@@ -384,6 +386,24 @@ class TestJournalEntry(ERPNextTestSuite):
 		self.assertEqual(jv.inter_company_journal_entry_reference, "")
 		self.assertEqual(jv1.inter_company_journal_entry_reference, "")
 
+	def test_validate_account_company_mismatch_on_save(self):
+		# Switching Company after the accounts table is filled in (without updating the
+		# accounts to match) must be rejected on save -- previously this only surfaced as a
+		# GL Entry error on submit, letting a mismatched draft sit around silently.
+		jv = make_journal_entry(
+			"Sales Expenses - _TC",
+			"Buildings - _TC",
+			100,
+			posting_date=nowdate(),
+			cost_center="Main - _TC",
+			save=True,
+		)
+
+		jv.company = "_Test Company 1"
+		for row in jv.accounts:
+			row.cost_center = "Main - _TC1"
+		self.assertRaises(frappe.ValidationError, jv.save)
+
 	def test_jv_with_cost_centre(self):
 		from erpnext.accounts.doctype.cost_center.test_cost_center import create_cost_center
 
@@ -460,6 +480,71 @@ class TestJournalEntry(ERPNextTestSuite):
 		]
 
 		self.check_gl_entries()
+
+	def make_jv_with_fractional_totals(self):
+		"""0.10 + 0.20 sums to 0.30000000000000004, the residue this guards against."""
+		jv = frappe.new_doc("Journal Entry")
+		jv.posting_date = nowdate()
+		jv.company = "_Test Company"
+		jv.voucher_type = "Journal Entry"
+		jv.remark = "test"
+		for amount in (0.10, 0.20):
+			jv.append(
+				"accounts",
+				{
+					"account": "_Test Cash - _TC",
+					"cost_center": "_Test Cost Center - _TC",
+					"debit_in_account_currency": amount,
+				},
+			)
+		jv.append(
+			"accounts",
+			{
+				"account": "_Test Bank - _TC",
+				"cost_center": "_Test Cost Center - _TC",
+				"credit_in_account_currency": 0.30,
+			},
+		)
+		jv.insert()
+		return jv
+
+	def test_totals_are_rounded_to_precision(self):
+		jv = self.make_jv_with_fractional_totals()
+		jv.submit()
+
+		stored = frappe.db.get_value(
+			"Journal Entry", jv.name, ["total_debit", "total_credit", "difference"], as_dict=True
+		)
+		self.assertEqual(jv.total_debit, flt(jv.total_debit, jv.precision("total_debit")))
+		self.assertEqual(jv.total_credit, flt(jv.total_credit, jv.precision("total_credit")))
+		self.assertEqual(jv.total_debit, stored.total_debit)
+		self.assertEqual(jv.total_credit, stored.total_credit)
+		self.assertEqual(jv.difference, stored.difference)
+
+	def test_update_after_submit_with_fractional_totals(self):
+		"""An unrounded total is stored rounded, so updating a submitted entry used to throw."""
+		jv = self.make_jv_with_fractional_totals()
+		jv.submit()
+
+		jv.pay_to_recd_from = "_Test Supplier"
+		jv.save()
+
+		self.assertEqual(jv.docstatus, 1)
+		self.assertEqual(
+			jv.pay_to_recd_from, frappe.db.get_value("Journal Entry", jv.name, "pay_to_recd_from")
+		)
+
+	def test_cancel_large_entry_queued_in_background(self):
+		jv = make_journal_entry("_Test Cash - _TC", "_Test Bank - _TC", 100, save=False)
+		for row in jv.accounts * 50:
+			jv.append("accounts", row.as_dict(no_default_fields=True))
+		jv.insert()
+
+		with patch.object(jv.meta, "queue_in_background", 1):
+			jv.submit()
+			jv.cancel()
+
+		self.assertEqual(frappe.db.get_value("Journal Entry", jv.name, "docstatus"), 2)
 
 	def test_jv_account_and_party_balance_with_cost_centre(self):
 		from erpnext.accounts.doctype.cost_center.test_cost_center import create_cost_center

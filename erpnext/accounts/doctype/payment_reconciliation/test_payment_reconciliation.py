@@ -330,6 +330,58 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 		for row in rows:
 			self.assertIsNotNone(row.outstanding)
 
+	def test_invoice_limit_keeps_a_voucher_outstanding_on_one_account(self):
+		"""The invoice limit must judge each party account on its own, like the main query.
+
+		A Journal Entry with +100 on one receivable account and -100 on another nets to 0. Netting it
+		dropped the voucher before the limit, so its +100 outstanding never showed.
+		"""
+		from erpnext.accounts.utils import get_outstanding_invoices
+
+		self.customer = (
+			frappe.get_doc(
+				{
+					"doctype": "Customer",
+					"customer_name": "_Test Invoice Limit Customer",
+					"customer_group": "_Test Customer Group",
+					"territory": "_Test Territory",
+				}
+			)
+			.insert()
+			.name
+		)
+		second_receivable = "_Test Receivable - _TC"
+		sales_invoice = self.create_sales_invoice(qty=1, rate=50)
+
+		je = frappe.new_doc("Journal Entry")
+		je.posting_date = nowdate()
+		je.company = self.company
+		for account, amount_field in (
+			(self.debit_to, "debit_in_account_currency"),
+			(second_receivable, "credit_in_account_currency"),
+		):
+			je.append(
+				"accounts",
+				{
+					"account": account,
+					"party_type": "Customer",
+					"party": self.customer,
+					"cost_center": self.main_cc,
+					amount_field: 100,
+				},
+			)
+		je.save()
+		je.submit()
+
+		invoices = get_outstanding_invoices(
+			"Customer", self.customer, [self.debit_to, second_receivable], limit=10
+		)
+		outstanding = {(row.voucher_no, row.account): row.outstanding_amount for row in invoices}
+
+		self.assertEqual(
+			outstanding, {(sales_invoice.name, self.debit_to): 50, (je.name, self.debit_to): 100}
+		)
+
 	def test_filter_min_max(self):
 		# check filter condition minimum and maximum amount
 		self.create_sales_invoice(qty=1, rate=300)
@@ -1658,6 +1710,77 @@ class TestPaymentReconciliation(ERPNextTestSuite):
 
 		# Should not raise frappe.exceptions.ValidationError: Payment Entry has been modified after you pulled it. Please pull it again.
 		pr.reconcile()
+
+	@ERPNextTestSuite.change_settings("System Settings", {"currency_precision": 2})
+	def test_allocate_entries_rounds_running_balance_to_currency_precision(self):
+		pr = frappe.new_doc("Payment Reconciliation")
+		pr.company = self.company
+		pr.party_type = "Customer"
+		pr.party = self.customer
+		pr.receivable_payable_account = self.debit_to
+		pr.set("invoices", [{"invoice_number": "INV-1"}])
+		pr.set("payments", [{"reference_name": "PAY-1"}])
+
+		invoices = [
+			{
+				"invoice_type": "Sales Invoice",
+				"invoice_number": "INV-1",
+				"outstanding_amount": 17592.415,
+				"currency": "INR",
+			},
+		]
+		payments = [
+			{
+				"reference_type": "Payment Entry",
+				"reference_name": "PAY-1",
+				"amount": 18230,
+				"currency": "INR",
+			}
+		]
+
+		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+
+		self.assertEqual(payments[0]["amount"], flt(637.585, 2))
+
+	@ERPNextTestSuite.change_settings(
+		"System Settings", {"currency_precision": "", "use_number_format_from_currency": 1}
+	)
+	def test_allocate_entries_rounds_running_balance_to_account_currency_precision(self):
+		account_currency = frappe.get_cached_value("Account", self.debit_to, "account_currency")
+		original_number_format = frappe.db.get_value("Currency", account_currency, "number_format")
+		frappe.db.set_value("Currency", account_currency, "number_format", "#,###.###")
+		self.addCleanup(
+			frappe.db.set_value, "Currency", account_currency, "number_format", original_number_format
+		)
+
+		pr = frappe.new_doc("Payment Reconciliation")
+		pr.company = self.company
+		pr.party_type = "Customer"
+		pr.party = self.customer
+		pr.receivable_payable_account = self.debit_to
+		pr.set("invoices", [{"invoice_number": "INV-1"}])
+		pr.set("payments", [{"reference_name": "PAY-1"}])
+
+		invoices = [
+			{
+				"invoice_type": "Sales Invoice",
+				"invoice_number": "INV-1",
+				"outstanding_amount": 17592.415,
+				"currency": account_currency,
+			},
+		]
+		payments = [
+			{
+				"reference_type": "Payment Entry",
+				"reference_name": "PAY-1",
+				"amount": 18230,
+				"currency": account_currency,
+			}
+		]
+
+		pr.allocate_entries(frappe._dict({"invoices": invoices, "payments": payments}))
+
+		self.assertEqual(payments[0]["amount"], flt(637.585, 3))
 
 	def test_reverse_payment_against_payment_for_supplier(self):
 		"""

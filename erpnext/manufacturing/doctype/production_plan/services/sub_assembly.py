@@ -68,7 +68,7 @@ class SubAssemblyService:
 
 		frappe.msgprint(
 			_(
-				"Row #{0}: Since 'Track Semi Finished Goods' is enabled, the BOM {1} cannot be used for Sub Assembly Items"
+				"Row #{0}: Since 'Produce an Item at Each Operation' is enabled, the BOM {1} cannot be used for Sub Assembly Items"
 			).format(row.idx, row.bom_no)
 		)
 		return True
@@ -159,6 +159,7 @@ class SubAssemblyService:
 	def _merge_subassembly_row(existing_row, row):
 		existing_row.qty += flt(row.qty)
 		existing_row.stock_qty += flt(row.stock_qty)
+		existing_row.required_qty += flt(row.required_qty)
 		existing_row.bom_level = max(existing_row.bom_level, row.bom_level)
 
 	def all_items_completed(self):

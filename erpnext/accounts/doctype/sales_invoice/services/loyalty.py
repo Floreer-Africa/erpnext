@@ -8,7 +8,7 @@ from frappe import _
 from frappe.utils import add_days, cint, flt, getdate
 
 from erpnext.accounts.doctype.loyalty_program.loyalty_program import (
-	get_loyalty_program_details_with_points,
+	_loyalty_program_details_with_points,
 )
 
 
@@ -21,7 +21,7 @@ class LoyaltyService:
 		returned_amount = self._get_returned_amount()
 		current_amount = flt(doc.grand_total) - cint(doc.loyalty_amount)
 		eligible_amount = current_amount - returned_amount
-		lp_details = get_loyalty_program_details_with_points(
+		lp_details = _loyalty_program_details_with_points(
 			doc.customer,
 			company=doc.company,
 			current_transaction_amount=current_amount,
@@ -125,7 +125,7 @@ class LoyaltyService:
 
 	def _set_loyalty_program_tier(self) -> None:
 		doc = self.doc
-		lp_details = get_loyalty_program_details_with_points(
+		lp_details = _loyalty_program_details_with_points(
 			doc.customer,
 			company=doc.company,
 			loyalty_program=doc.loyalty_program,

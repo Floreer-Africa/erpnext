@@ -73,6 +73,7 @@ frappe.ui.form.on("Item", {
 	},
 
 	setup: function (frm) {
+		frm.set_query("item_group", () => ({ filters: { is_group: 0 } }));
 		frm.set_query("allowed_companies", () => ({
 			query: "erpnext.stock.doctype.company_restriction.company_restriction.company_query",
 		}));
@@ -170,7 +171,7 @@ frappe.ui.form.on("Item", {
 		if (frappe.defaults.get_default("item_naming_by") != "Naming Series" || frm.doc.variant_of) {
 			frm.toggle_display("naming_series", false);
 		} else {
-			erpnext.toggle_naming_series();
+			erpnext.toggle_naming_series(frm);
 		}
 
 		frm.toggle_display(["standard_rate"], frappe.model.can_create("Item Price"));
@@ -1133,10 +1134,7 @@ $.extend(erpnext.item, {
 			],
 		});
 
-		dialog.set_primary_action(__("Create"), function () {
-			var data = dialog.get_values();
-			if (!data) return;
-
+		dialog.set_primary_action(__("Create"), function (data) {
 			// call the server to make the variant
 			data.template = frm.doc.name;
 			frappe.call({
@@ -1475,15 +1473,13 @@ $.extend(erpnext.item, {
 			fields: fields,
 		});
 
-		d.set_primary_action(__("Create"), function () {
-			var args = d.get_values();
-			if (!args) return;
+		d.set_primary_action(__("Create"), function (args) {
 			frappe.call({
 				method: "erpnext.controllers.item_variant.get_variant",
 				btn: d.get_primary_btn(),
 				args: {
 					template: frm.doc.name,
-					args: d.get_values(),
+					args: args,
 				},
 				callback: function (r) {
 					// returns variant item
@@ -1510,7 +1506,7 @@ $.extend(erpnext.item, {
 							method: "erpnext.controllers.item_variant.create_variant",
 							args: {
 								item: frm.doc.name,
-								args: d.get_values(),
+								args: args,
 								use_template_image: args.use_template_image,
 							},
 							callback: function (r) {

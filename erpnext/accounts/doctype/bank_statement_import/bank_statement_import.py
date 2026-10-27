@@ -72,7 +72,7 @@ class BankStatementImport(DataImport):
 			self.template_warnings = ""
 
 		if self.import_file and not self.import_file.lower().endswith(".txt"):
-			self.validate_import_file()
+			self.get_importer()
 			self.validate_google_sheets_url()
 
 	def start_import(self):
@@ -437,6 +437,11 @@ def get_import_logs(docname: str):
 
 @frappe.whitelist()
 def upload_bank_statement(**args):
+	# The only caller is the Bank Reconciliation Tool's "Upload Bank Statement" button, whose
+	# callback routes straight into a new Bank Statement Import form — so `create` is exactly the
+	# right to require, and both doctypes are System Manager only, which makes it loser-free.
+	frappe.has_permission("Bank Statement Import", "create", throw=True)
+
 	args = frappe._dict(args)
 	bsi = frappe.new_doc("Bank Statement Import")
 
