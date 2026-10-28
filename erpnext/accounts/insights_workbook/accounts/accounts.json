@@ -575,9 +575,14 @@
     ],
     "rows": [
      {
-      "column_name": "customer",
+      "column_name": "customer_name",
       "data_type": "String",
       "dimension_name": "Customer"
+     },
+     {
+      "column_name": "customer",
+      "data_type": "String",
+      "dimension_name": "Customer ID"
      }
     ],
     "values": [
@@ -913,7 +918,7 @@
  "folders": [],
  "idx": 0,
  "is_standard": 1,
- "modified": "2026-09-28 12:12:12.832764",
+ "modified": "2026-10-28 14:00:00.000000",
  "modified_by": "Administrator",
  "module": "Accounts",
  "name": "accounts",
@@ -2148,6 +2153,31 @@
      },
      "new_name": "overdue",
      "type": "mutate"
+    },
+    {
+     "join_condition": {
+      "left_column": {
+       "column_name": "customer",
+       "type": "column"
+      },
+      "right_column": {
+       "column_name": "name",
+       "type": "column"
+      }
+     },
+     "join_type": "left",
+     "select_columns": [
+      {
+       "column_name": "customer_name",
+       "type": "column"
+      }
+     ],
+     "table": {
+      "data_source": "Site DB",
+      "table_name": "tabCustomer",
+      "type": "table"
+     },
+     "type": "join"
     }
    ],
    "sort_order": 12,

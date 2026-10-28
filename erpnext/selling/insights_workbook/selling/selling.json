@@ -211,7 +211,7 @@
       "dimension_name": "Sales Order"
      },
      {
-      "column_name": "customer",
+      "column_name": "customer_name",
       "data_type": "String",
       "dimension_name": "Customer"
      }
@@ -447,7 +447,7 @@
     ],
     "x_axis": {
      "dimension": {
-      "column_name": "customer",
+      "column_name": "customer_name",
       "data_type": "String",
       "dimension_name": "Customer"
      }
@@ -797,7 +797,7 @@
  "folders": [],
  "idx": 0,
  "is_standard": 1,
- "modified": "2026-09-28 12:09:41.525572",
+ "modified": "2026-10-28 14:00:00.000000",
  "modified_by": "Administrator",
  "module": "Selling",
  "name": "selling",
@@ -836,6 +836,7 @@
      "column_names": [
       "sales_order",
       "customer",
+      "customer_name",
       "delivery_date",
       "days_late",
       "value_to_deliver",
@@ -1146,6 +1147,7 @@
       "sales_order",
       "transaction_date",
       "customer",
+      "customer_name",
       "base_net_total",
       "company",
       "territory"
@@ -1300,6 +1302,10 @@
        "type": "column"
       },
       {
+       "column_name": "customer_name",
+       "type": "column"
+      },
+      {
        "column_name": "company",
        "type": "column"
       },
@@ -1394,6 +1400,7 @@
      "column_names": [
       "sales_order",
       "customer",
+      "customer_name",
       "item_code",
       "delivery_date",
       "days_late",
