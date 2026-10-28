@@ -447,7 +447,7 @@
     ],
     "x_axis": {
      "dimension": {
-      "column_name": "customer_name",
+      "column_name": "customer_label",
       "data_type": "String",
       "dimension_name": "Customer"
      }
@@ -797,7 +797,7 @@
  "folders": [],
  "idx": 0,
  "is_standard": 1,
- "modified": "2026-10-28 14:00:00.000000",
+ "modified": "2026-10-29 09:00:00.000000",
  "modified_by": "Administrator",
  "module": "Selling",
  "name": "selling",
@@ -1143,11 +1143,21 @@
      "type": "mutate"
     },
     {
+     "data_type": "String",
+     "expression": {
+      "expression": "concat(customer_name, ' (', customer, ')')",
+      "type": "expression"
+     },
+     "new_name": "customer_label",
+     "type": "mutate"
+    },
+    {
      "column_names": [
       "sales_order",
       "transaction_date",
       "customer",
       "customer_name",
+      "customer_label",
       "base_net_total",
       "company",
       "territory"
