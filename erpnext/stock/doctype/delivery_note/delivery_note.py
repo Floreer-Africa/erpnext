@@ -562,7 +562,10 @@ class DeliveryNote(SellingController):
 
 		# Updating stock ledger should always be called after updating prevdoc status,
 		# because updating reserved qty in bin depends upon updated delivered qty in SO
-		self.update_stock_ledger()
+		# Floreer framework#292: pass the per-voucher negative-stock flag, as the Sales
+		# Invoice does (framework#166). Every layer below accepts it; without this no
+		# Delivery Note can post at negative stock deliberately. Defaults False.
+		self.update_stock_ledger(allow_negative_stock=bool(self.flags.get("allow_negative_stock")))
 		self.make_gl_entries()
 		self.repost_future_sle_and_gle()
 		self.update_project_consumed_material_cost()
@@ -580,7 +583,10 @@ class DeliveryNote(SellingController):
 
 		# Updating stock ledger should always be called after updating prevdoc status,
 		# because updating reserved qty in bin depends upon updated delivered qty in SO
-		self.update_stock_ledger()
+		# Floreer framework#292: pass the per-voucher negative-stock flag, as the Sales
+		# Invoice does (framework#166). Every layer below accepts it; without this no
+		# Delivery Note can post at negative stock deliberately. Defaults False.
+		self.update_stock_ledger(allow_negative_stock=bool(self.flags.get("allow_negative_stock")))
 
 		PackingService(self).cancel_packing_slips()
 		self.update_pick_list_status()
