@@ -5,6 +5,10 @@ frappe.ui.form.on("Sales Order", {
 	refresh(frm) {
 		erpnext.proforma.toggle_tab(frm, false);
 		if (frm.doc.docstatus === 0) return;
+		// framework#351: only System Manager can read Selling Settings, so for Sales/Stock
+		// users the flag read raised "No permission for Selling Settings" on every submitted
+		// order, and its answer was always "not enabled" anyway. Skip it; proforma stays hidden.
+		if (!frappe.model.can_read("Selling Settings")) return;
 
 		frappe.db.get_single_value("Selling Settings", "enable_proforma_invoice").then((enabled) => {
 			if (!enabled) return;
